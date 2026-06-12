@@ -1,0 +1,74 @@
+services:
+  haproxy:
+    image: haproxy:3.0-alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./infra/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "32MB"
+
+  api1:
+    build: .
+    environment:
+      LISTEN_ADDR: ":8080"
+      REDIS_ADDR: "valkey:6379"
+      WORKERS: "20"
+      MAX_PROCESSOR_CONNS: "48"
+      PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
+      PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
+    depends_on:
+      - valkey
+    networks:
+      - backend
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "80MB"
+
+  api2:
+    build: .
+    environment:
+      LISTEN_ADDR: ":8080"
+      REDIS_ADDR: "valkey:6379"
+      WORKERS: "20"
+      MAX_PROCESSOR_CONNS: "48"
+      PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
+      PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
+    depends_on:
+      - valkey
+    networks:
+      - backend
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "80MB"
+
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: "150MB"
+
+networks:
+  backend:
+    driver: bridge
+  payment-processor:
+    external: true
