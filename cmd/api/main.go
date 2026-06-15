@@ -25,7 +25,8 @@ func main() {
 
 	cfg := configFromEnv()
 	st := store.NewRedis(store.RedisConfig{
-		Addr: cfg.redisAddr,
+		Addr:            cfg.redisAddr,
+		ProcessingLease: cfg.processingLease,
 	})
 	defer st.Close()
 
@@ -107,6 +108,7 @@ type config struct {
 	defaultURL        string
 	fallbackURL       string
 	processorTimeout  time.Duration
+	processingLease    time.Duration
 	healthGrace       time.Duration
 	maxProcessorConns int
 	workerCount       int
@@ -122,7 +124,8 @@ func configFromEnv() config {
 		redisAddr:         envString("REDIS_ADDR", "valkey:6379"),
 		defaultURL:        envString("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
 		fallbackURL:       envString("PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
-		processorTimeout:  envDurationMS("PROCESSOR_TIMEOUT_MS", 900*time.Millisecond),
+		processorTimeout:  envDurationMS("PROCESSOR_TIMEOUT_MS", 11*time.Second),
+		processingLease:   envDurationMS("PROCESSING_LEASE_MS", 15*time.Second),
 		healthGrace:       envDurationMS("PROCESSOR_HEALTH_GRACE_MS", 1200*time.Millisecond),
 		maxProcessorConns: envInt("MAX_PROCESSOR_CONNS", 64),
 		workerCount:       envInt("WORKERS", 24),

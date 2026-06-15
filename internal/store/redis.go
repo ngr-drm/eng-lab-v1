@@ -13,17 +13,23 @@ import (
 )
 
 type RedisConfig struct {
-	Addr string
+	Addr            string
+	ProcessingLease time.Duration
 }
 
 type Redis struct {
-	client *redis.Client
+	client          *redis.Client
+	processingLease time.Duration
 }
 
 func NewRedis(cfg RedisConfig) *Redis {
 	addr := cfg.Addr
 	if addr == "" {
 		addr = "valkey:6379"
+	}
+	processingLease := cfg.ProcessingLease
+	if processingLease <= 0 {
+		processingLease = 15 * time.Second
 	}
 	return &Redis{
 		client: redis.NewClient(&redis.Options{
@@ -32,6 +38,7 @@ func NewRedis(cfg RedisConfig) *Redis {
 			MinIdleConns: 8,
 			MaxRetries:   1,
 		}),
+		processingLease: processingLease,
 	}
 }
 
@@ -54,13 +61,14 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 	return result == 1, nil
 }
 
-func (r *Redis) PopPending(ctx context.Context, wait time.Duration) (payments.Payment, bool, error) {
+func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
 	deadline := time.Now().Add(wait)
 	for {
 		now := time.Now()
 		result, err := popPendingScript.Run(ctx, r.client, nil,
 			now.UTC().UnixMilli(),
-			now.Add(processingLease).UTC().UnixMilli(),
+			now.Add(r.processingLease).UTC().UnixMilli(),
+			string(preferredProcessor),
 		).Slice()
 		if err != nil {
 			return payments.Payment{}, false, err
@@ -98,18 +106,6 @@ func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay tim
 		}
 	}
 	return requeueScript.Run(ctx, r.client, nil, payment.CorrelationID, payment.LeaseID).Err()
-}
-
-func (r *Redis) SelectProcessor(ctx context.Context, payment payments.Payment, processor payments.ProcessorName) (bool, error) {
-	result, err := selectProcessorScript.Run(ctx, r.client, nil,
-		payment.CorrelationID,
-		payment.LeaseID,
-		string(processor),
-	).Int()
-	if err != nil {
-		return false, err
-	}
-	return result == 1, nil
 }
 
 func (r *Redis) RecoverProcessing(ctx context.Context) error {
@@ -273,7 +269,6 @@ func (r *Redis) aggregateBucket(ctx context.Context, processor payments.Processo
 
 const (
 	pendingQueueKey      = "payments:pending"
-	processingLease      = 10 * time.Second
 	emptyPopResultCode   = int64(0)
 	paymentPopResultCode = int64(1)
 	skippedPopResultCode = int64(2)
@@ -334,10 +329,16 @@ if redis.call('HGET', key, 'status') ~= 'pending' then
 end
 
 local lease_id = tostring(redis.call('INCR', 'payments:lease-seq'))
+local processor_attempt = redis.call('HGET', key, 'processor_attempt')
+if not processor_attempt or processor_attempt == '' then
+  processor_attempt = ARGV[3]
+end
+
 redis.call('HSET', key,
   'status', 'processing',
   'lease_id', lease_id,
-  'lease_until_ms', ARGV[2]
+  'lease_until_ms', ARGV[2],
+  'processor_attempt', processor_attempt
 )
 redis.call('ZADD', 'payments:processing-leases', ARGV[2], id)
 return {
@@ -346,28 +347,8 @@ return {
   redis.call('HGET', key, 'amount_cents'),
   redis.call('HGET', key, 'requested_at'),
   lease_id,
-  redis.call('HGET', key, 'processor_attempt') or ''
+  processor_attempt
 }
-`)
-
-var selectProcessorScript = redis.NewScript(`
-local key = 'payment:' .. ARGV[1]
-
-if redis.call('HGET', key, 'status') ~= 'processing' then
-  return 0
-end
-
-if redis.call('HGET', key, 'lease_id') ~= ARGV[2] then
-  return 0
-end
-
-local current = redis.call('HGET', key, 'processor_attempt')
-if current and current ~= ARGV[3] then
-  return 0
-end
-
-redis.call('HSET', key, 'processor_attempt', ARGV[3])
-return 1
 `)
 
 var confirmScript = redis.NewScript(`

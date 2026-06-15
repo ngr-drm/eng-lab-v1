@@ -11,9 +11,8 @@ import (
 type Store interface {
 	EnqueuePayment(ctx context.Context, payment Payment, maxQueueDepth int64) (bool, error)
 	RecoverProcessing(ctx context.Context) error
-	PopPending(ctx context.Context, wait time.Duration) (Payment, bool, error)
+	PopPending(ctx context.Context, wait time.Duration, preferredProcessor ProcessorName) (Payment, bool, error)
 	PendingDepth(ctx context.Context) (int64, error)
-	SelectProcessor(ctx context.Context, payment Payment, processor ProcessorName) (bool, error)
 	Requeue(ctx context.Context, payment Payment, delay time.Duration) error
 	Confirm(ctx context.Context, payment Payment, processor ProcessorName) (bool, error)
 	Summary(ctx context.Context, from, to *time.Time) (Summary, error)
@@ -123,7 +122,8 @@ func (s *Service) worker(ctx context.Context, id int) {
 		default:
 		}
 
-		payment, ok, err := s.store.PopPending(ctx, s.queueWait)
+		preferredProcessor := s.selectNewProcessor(ctx)
+		payment, ok, err := s.store.PopPending(ctx, s.queueWait, preferredProcessor)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -141,25 +141,12 @@ func (s *Service) worker(ctx context.Context, id int) {
 }
 
 func (s *Service) processOne(ctx context.Context, workerID int, payment Payment) {
-	proc := s.selectProcessor(ctx, payment)
+	proc := s.processorByName(payment.ProcessorAttempt)
 	if proc == nil {
 		if err := s.store.Requeue(ctx, payment, s.retryDelay); err != nil {
 			s.logger.Warn("failed to requeue payment without processor", "worker", workerID, "correlationId", payment.CorrelationID, "err", err)
 		}
 		return
-	}
-
-	if payment.ProcessorAttempt == "" {
-		selected, err := s.store.SelectProcessor(ctx, payment, proc.Name())
-		if err != nil {
-			s.logger.Warn("failed to select processor", "worker", workerID, "processor", proc.Name(), "correlationId", payment.CorrelationID, "err", err)
-			_ = s.store.Requeue(ctx, payment, s.retryDelay)
-			return
-		}
-		if !selected {
-			return
-		}
-		payment.ProcessorAttempt = proc.Name()
 	}
 
 	if err := proc.Process(ctx, payment); err == nil {
@@ -180,27 +167,30 @@ func (s *Service) processOne(ctx context.Context, workerID int, payment Payment)
 	}
 }
 
-func (s *Service) selectProcessor(ctx context.Context, payment Payment) Processor {
-	if payment.ProcessorAttempt == ProcessorDefault {
-		return s.defaultProcessor
-	}
-	if payment.ProcessorAttempt == ProcessorFallback {
-		return s.fallbackProcessor
-	}
-
+func (s *Service) selectNewProcessor(ctx context.Context) ProcessorName {
 	defaultHealthy := s.defaultProcessor.Healthy(ctx)
 	fallbackHealthy := s.fallbackProcessor.Healthy(ctx)
 
 	if defaultHealthy {
 		if fallbackHealthy && s.shouldShedToFallback(ctx) {
-			return s.fallbackProcessor
+			return ProcessorFallback
 		}
-		return s.defaultProcessor
+		return ProcessorDefault
 	}
 	if fallbackHealthy {
+		return ProcessorFallback
+	}
+	return ProcessorDefault
+}
+
+func (s *Service) processorByName(name ProcessorName) Processor {
+	if name == ProcessorDefault {
+		return s.defaultProcessor
+	}
+	if name == ProcessorFallback {
 		return s.fallbackProcessor
 	}
-	return s.defaultProcessor
+	return nil
 }
 
 func (s *Service) shouldShedToFallback(ctx context.Context) bool {
