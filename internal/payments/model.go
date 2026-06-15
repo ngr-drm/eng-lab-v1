@@ -16,9 +16,11 @@ const (
 )
 
 type Payment struct {
-	CorrelationID string
-	AmountCents   int64
-	RequestedAt   time.Time
+	CorrelationID    string
+	AmountCents      int64
+	RequestedAt      time.Time
+	LeaseID          string
+	ProcessorAttempt ProcessorName
 }
 
 type ConfirmedPayment struct {

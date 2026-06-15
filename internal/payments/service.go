@@ -12,6 +12,8 @@ type Store interface {
 	EnqueuePayment(ctx context.Context, payment Payment, maxQueueDepth int64) (bool, error)
 	RecoverProcessing(ctx context.Context) error
 	PopPending(ctx context.Context, wait time.Duration) (Payment, bool, error)
+	PendingDepth(ctx context.Context) (int64, error)
+	SelectProcessor(ctx context.Context, payment Payment, processor ProcessorName) (bool, error)
 	Requeue(ctx context.Context, payment Payment, delay time.Duration) error
 	Confirm(ctx context.Context, payment Payment, processor ProcessorName) (bool, error)
 	Summary(ctx context.Context, from, to *time.Time) (Summary, error)
@@ -32,6 +34,7 @@ type ServiceConfig struct {
 	QueueWait         time.Duration
 	RetryDelay        time.Duration
 	MaxQueueDepth     int64
+	FallbackQueueSize int64
 }
 
 type Service struct {
@@ -43,6 +46,7 @@ type Service struct {
 	queueWait         time.Duration
 	retryDelay        time.Duration
 	maxQueueDepth     int64
+	fallbackQueueSize int64
 	startOnce         sync.Once
 }
 
@@ -64,6 +68,7 @@ func NewService(cfg ServiceConfig) *Service {
 		queueWait:         cfg.QueueWait,
 		retryDelay:        cfg.RetryDelay,
 		maxQueueDepth:     cfg.MaxQueueDepth,
+		fallbackQueueSize: cfg.FallbackQueueSize,
 	}
 }
 
@@ -86,13 +91,28 @@ func (s *Service) Summary(ctx context.Context, from, to *time.Time) (Summary, er
 
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
-		if err := s.store.RecoverProcessing(ctx); err != nil {
-			s.logger.Warn("failed to recover processing queue", "err", err)
-		}
+		go s.recoverLoop(ctx)
 		for i := 0; i < s.workerCount; i++ {
 			go s.worker(ctx, i)
 		}
 	})
+}
+
+func (s *Service) recoverLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if err := s.store.RecoverProcessing(ctx); err != nil && ctx.Err() == nil {
+			s.logger.Warn("failed to recover processing queue", "err", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Service) worker(ctx context.Context, id int) {
@@ -121,20 +141,38 @@ func (s *Service) worker(ctx context.Context, id int) {
 }
 
 func (s *Service) processOne(ctx context.Context, workerID int, payment Payment) {
-	processors := s.processorOrder(ctx)
-	for _, proc := range processors {
-		if err := proc.Process(ctx, payment); err == nil {
-			confirmed, confirmErr := s.store.Confirm(ctx, payment, proc.Name())
-			if confirmErr != nil {
-				s.logger.Error("payment confirmed remotely but local confirmation failed", "worker", workerID, "processor", proc.Name(), "correlationId", payment.CorrelationID, "err", confirmErr)
-				_ = s.store.Requeue(context.Background(), payment, s.retryDelay)
-				return
-			}
-			if confirmed {
-				return
-			}
+	proc := s.selectProcessor(ctx, payment)
+	if proc == nil {
+		if err := s.store.Requeue(ctx, payment, s.retryDelay); err != nil {
+			s.logger.Warn("failed to requeue payment without processor", "worker", workerID, "correlationId", payment.CorrelationID, "err", err)
+		}
+		return
+	}
+
+	if payment.ProcessorAttempt == "" {
+		selected, err := s.store.SelectProcessor(ctx, payment, proc.Name())
+		if err != nil {
+			s.logger.Warn("failed to select processor", "worker", workerID, "processor", proc.Name(), "correlationId", payment.CorrelationID, "err", err)
+			_ = s.store.Requeue(ctx, payment, s.retryDelay)
 			return
 		}
+		if !selected {
+			return
+		}
+		payment.ProcessorAttempt = proc.Name()
+	}
+
+	if err := proc.Process(ctx, payment); err == nil {
+		confirmed, confirmErr := s.store.Confirm(ctx, payment, proc.Name())
+		if confirmErr != nil {
+			s.logger.Error("payment confirmed remotely but local confirmation failed", "worker", workerID, "processor", proc.Name(), "correlationId", payment.CorrelationID, "err", confirmErr)
+			_ = s.store.Requeue(context.Background(), payment, s.retryDelay)
+			return
+		}
+		if confirmed {
+			return
+		}
+		return
 	}
 
 	if err := s.store.Requeue(ctx, payment, s.retryDelay); err != nil {
@@ -142,18 +180,37 @@ func (s *Service) processOne(ctx context.Context, workerID int, payment Payment)
 	}
 }
 
-func (s *Service) processorOrder(ctx context.Context) []Processor {
+func (s *Service) selectProcessor(ctx context.Context, payment Payment) Processor {
+	if payment.ProcessorAttempt == ProcessorDefault {
+		return s.defaultProcessor
+	}
+	if payment.ProcessorAttempt == ProcessorFallback {
+		return s.fallbackProcessor
+	}
+
 	defaultHealthy := s.defaultProcessor.Healthy(ctx)
 	fallbackHealthy := s.fallbackProcessor.Healthy(ctx)
 
 	if defaultHealthy {
-		if fallbackHealthy {
-			return []Processor{s.defaultProcessor, s.fallbackProcessor}
+		if fallbackHealthy && s.shouldShedToFallback(ctx) {
+			return s.fallbackProcessor
 		}
-		return []Processor{s.defaultProcessor}
+		return s.defaultProcessor
 	}
 	if fallbackHealthy {
-		return []Processor{s.fallbackProcessor, s.defaultProcessor}
+		return s.fallbackProcessor
 	}
-	return []Processor{s.defaultProcessor, s.fallbackProcessor}
+	return s.defaultProcessor
+}
+
+func (s *Service) shouldShedToFallback(ctx context.Context) bool {
+	if s.fallbackQueueSize <= 0 {
+		return false
+	}
+	depth, err := s.store.PendingDepth(ctx)
+	if err != nil {
+		s.logger.Warn("failed to read pending queue depth", "err", err)
+		return false
+	}
+	return depth >= s.fallbackQueueSize
 }

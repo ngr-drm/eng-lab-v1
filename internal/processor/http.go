@@ -129,6 +129,9 @@ func (c *HTTPClient) Process(ctx context.Context, payment payments.Payment) erro
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
+	if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusUnprocessableEntity {
+		return nil
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return errors.New(resp.Status)
 	}

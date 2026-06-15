@@ -36,7 +36,7 @@ func main() {
 		MaxConns:    cfg.maxProcessorConns,
 		IdleConns:   cfg.maxProcessorConns,
 		HealthTTL:   5 * time.Second,
-		HealthGrace: 1200 * time.Millisecond,
+		HealthGrace: cfg.healthGrace,
 		HealthCache: st,
 	})
 	fallbackProcessor := processor.NewHTTPClient(processor.Config{
@@ -46,7 +46,7 @@ func main() {
 		MaxConns:    cfg.maxProcessorConns,
 		IdleConns:   cfg.maxProcessorConns,
 		HealthTTL:   5 * time.Second,
-		HealthGrace: 1200 * time.Millisecond,
+		HealthGrace: cfg.healthGrace,
 		HealthCache: st,
 	})
 
@@ -59,6 +59,7 @@ func main() {
 		QueueWait:         cfg.queueWait,
 		RetryDelay:        cfg.retryDelay,
 		MaxQueueDepth:     cfg.maxQueueDepth,
+		FallbackQueueSize: cfg.fallbackQueueSize,
 	})
 
 	service.Start(ctx)
@@ -106,11 +107,13 @@ type config struct {
 	defaultURL        string
 	fallbackURL       string
 	processorTimeout  time.Duration
+	healthGrace       time.Duration
 	maxProcessorConns int
 	workerCount       int
 	queueWait         time.Duration
 	retryDelay        time.Duration
 	maxQueueDepth     int64
+	fallbackQueueSize int64
 }
 
 func configFromEnv() config {
@@ -120,11 +123,13 @@ func configFromEnv() config {
 		defaultURL:        envString("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
 		fallbackURL:       envString("PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
 		processorTimeout:  envDurationMS("PROCESSOR_TIMEOUT_MS", 900*time.Millisecond),
+		healthGrace:       envDurationMS("PROCESSOR_HEALTH_GRACE_MS", 1200*time.Millisecond),
 		maxProcessorConns: envInt("MAX_PROCESSOR_CONNS", 64),
 		workerCount:       envInt("WORKERS", 24),
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
+		fallbackQueueSize: int64(envInt("FALLBACK_QUEUE_SIZE", 2500)),
 	}
 }
 

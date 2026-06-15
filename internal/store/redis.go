@@ -2,7 +2,7 @@ package store
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -55,24 +55,36 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 }
 
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration) (payments.Payment, bool, error) {
-	timeout := int(wait.Seconds())
-	if timeout < 1 {
-		timeout = 1
-	}
-
-	correlationID, err := r.client.BRPopLPush(ctx, pendingQueueKey, processingQueueKey, time.Duration(timeout)*time.Second).Result()
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
+	deadline := time.Now().Add(wait)
+	for {
+		now := time.Now()
+		result, err := popPendingScript.Run(ctx, r.client, nil,
+			now.UTC().UnixMilli(),
+			now.Add(processingLease).UTC().UnixMilli(),
+		).Slice()
+		if err != nil {
+			return payments.Payment{}, false, err
+		}
+		payment, ok, err := paymentFromPopResult(result)
+		if err != nil || ok {
+			return payment, ok, err
+		}
+		if !deadline.After(time.Now()) {
 			return payments.Payment{}, false, nil
 		}
-		return payments.Payment{}, false, err
+
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return payments.Payment{}, false, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	payment, ok, err := r.paymentByCorrelationID(ctx, correlationID)
-	if err != nil || ok {
-		return payment, ok, err
-	}
-	_ = r.client.LRem(ctx, processingQueueKey, 0, correlationID).Err()
-	return payments.Payment{}, false, nil
+}
+
+func (r *Redis) PendingDepth(ctx context.Context) (int64, error) {
+	return r.client.LLen(ctx, pendingQueueKey).Result()
 }
 
 func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay time.Duration) error {
@@ -85,19 +97,31 @@ func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay tim
 		case <-timer.C:
 		}
 	}
-	return requeueScript.Run(ctx, r.client, nil, payment.CorrelationID).Err()
+	return requeueScript.Run(ctx, r.client, nil, payment.CorrelationID, payment.LeaseID).Err()
+}
+
+func (r *Redis) SelectProcessor(ctx context.Context, payment payments.Payment, processor payments.ProcessorName) (bool, error) {
+	result, err := selectProcessorScript.Run(ctx, r.client, nil,
+		payment.CorrelationID,
+		payment.LeaseID,
+		string(processor),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
 }
 
 func (r *Redis) RecoverProcessing(ctx context.Context) error {
-	for {
-		_, err := r.client.RPopLPush(ctx, processingQueueKey, pendingQueueKey).Result()
-		if errors.Is(err, redis.Nil) {
-			return nil
-		}
+	now := time.Now().UTC().UnixMilli()
+	for recovered := 1; recovered > 0; {
+		count, err := recoverProcessingScript.Run(ctx, r.client, nil, now, 100).Int()
 		if err != nil {
 			return err
 		}
+		recovered = count
 	}
+	return nil
 }
 
 func (r *Redis) Confirm(ctx context.Context, payment payments.Payment, processor payments.ProcessorName) (bool, error) {
@@ -106,6 +130,7 @@ func (r *Redis) Confirm(ctx context.Context, payment payments.Payment, processor
 		string(processor),
 		payment.AmountCents,
 		payment.RequestedAt.UTC().UnixMilli(),
+		payment.LeaseID,
 	).Int()
 	if err != nil {
 		return false, err
@@ -246,32 +271,12 @@ func (r *Redis) aggregateBucket(ctx context.Context, processor payments.Processo
 	}, nil
 }
 
-func (r *Redis) paymentByCorrelationID(ctx context.Context, correlationID string) (payments.Payment, bool, error) {
-	fields, err := r.client.HGetAll(ctx, paymentKey(correlationID)).Result()
-	if err != nil {
-		return payments.Payment{}, false, err
-	}
-	if len(fields) == 0 || fields["status"] == "confirmed" {
-		return payments.Payment{}, false, nil
-	}
-	amount, err := strconv.ParseInt(fields["amount_cents"], 10, 64)
-	if err != nil {
-		return payments.Payment{}, false, err
-	}
-	requestedAt, err := time.Parse(time.RFC3339Nano, fields["requested_at"])
-	if err != nil {
-		return payments.Payment{}, false, err
-	}
-	return payments.Payment{
-		CorrelationID: correlationID,
-		AmountCents:   amount,
-		RequestedAt:   requestedAt.UTC(),
-	}, true, nil
-}
-
 const (
-	pendingQueueKey    = "payments:pending"
-	processingQueueKey = "payments:processing"
+	pendingQueueKey      = "payments:pending"
+	processingLease      = 10 * time.Second
+	emptyPopResultCode   = int64(0)
+	paymentPopResultCode = int64(1)
+	skippedPopResultCode = int64(2)
 )
 
 func paymentKey(correlationID string) string {
@@ -317,19 +322,74 @@ redis.call('RPUSH', queue, ARGV[1])
 return 1
 `)
 
+var popPendingScript = redis.NewScript(`
+local id = redis.call('LPOP', 'payments:pending')
+if not id then
+  return {0}
+end
+
+local key = 'payment:' .. id
+if redis.call('HGET', key, 'status') ~= 'pending' then
+  return {2}
+end
+
+local lease_id = tostring(redis.call('INCR', 'payments:lease-seq'))
+redis.call('HSET', key,
+  'status', 'processing',
+  'lease_id', lease_id,
+  'lease_until_ms', ARGV[2]
+)
+redis.call('ZADD', 'payments:processing-leases', ARGV[2], id)
+return {
+  1,
+  id,
+  redis.call('HGET', key, 'amount_cents'),
+  redis.call('HGET', key, 'requested_at'),
+  lease_id,
+  redis.call('HGET', key, 'processor_attempt') or ''
+}
+`)
+
+var selectProcessorScript = redis.NewScript(`
+local key = 'payment:' .. ARGV[1]
+
+if redis.call('HGET', key, 'status') ~= 'processing' then
+  return 0
+end
+
+if redis.call('HGET', key, 'lease_id') ~= ARGV[2] then
+  return 0
+end
+
+local current = redis.call('HGET', key, 'processor_attempt')
+if current and current ~= ARGV[3] then
+  return 0
+end
+
+redis.call('HSET', key, 'processor_attempt', ARGV[3])
+return 1
+`)
+
 var confirmScript = redis.NewScript(`
 local key = 'payment:' .. ARGV[1]
 local processor = ARGV[2]
 local amount_cents = ARGV[3]
 local requested_at_ms = ARGV[4]
+local lease_id = ARGV[5]
 
 if redis.call('EXISTS', key) == 0 then
-  redis.call('LREM', 'payments:processing', 0, ARGV[1])
   return 0
 end
 
 if redis.call('HGET', key, 'status') == 'confirmed' then
-  redis.call('LREM', 'payments:processing', 0, ARGV[1])
+  return 0
+end
+
+if redis.call('HGET', key, 'status') ~= 'processing' then
+  return 0
+end
+
+if redis.call('HGET', key, 'lease_id') ~= lease_id then
   return 0
 end
 
@@ -337,7 +397,8 @@ redis.call('HSET', key,
   'status', 'confirmed',
   'processor', processor
 )
-redis.call('LREM', 'payments:processing', 0, ARGV[1])
+redis.call('HDEL', key, 'lease_id', 'lease_until_ms')
+redis.call('ZREM', 'payments:processing-leases', ARGV[1])
 redis.call('ZADD', 'payments:confirmed:' .. processor, requested_at_ms, ARGV[1])
 redis.call('HINCRBY', 'payments:summary:' .. processor, 'total_requests', 1)
 redis.call('HINCRBY', 'payments:summary:' .. processor, 'total_cents', amount_cents)
@@ -345,9 +406,98 @@ return 1
 `)
 
 var requeueScript = redis.NewScript(`
-redis.call('LREM', 'payments:processing', 0, ARGV[1])
-if redis.call('HGET', 'payment:' .. ARGV[1], 'status') ~= 'confirmed' then
-  redis.call('RPUSH', 'payments:pending', ARGV[1])
+local key = 'payment:' .. ARGV[1]
+
+if redis.call('HGET', key, 'status') ~= 'processing' then
+  return 0
 end
+
+if redis.call('HGET', key, 'lease_id') ~= ARGV[2] then
+  return 0
+end
+
+redis.call('HSET', key, 'status', 'pending')
+redis.call('HDEL', key, 'lease_id', 'lease_until_ms')
+redis.call('ZREM', 'payments:processing-leases', ARGV[1])
+redis.call('RPUSH', 'payments:pending', ARGV[1])
 return 1
 `)
+
+var recoverProcessingScript = redis.NewScript(`
+local expired = redis.call('ZRANGEBYSCORE', 'payments:processing-leases', '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local recovered = 0
+
+for _, id in ipairs(expired) do
+  local key = 'payment:' .. id
+  if redis.call('HGET', key, 'status') == 'processing' then
+    redis.call('HSET', key, 'status', 'pending')
+    redis.call('HDEL', key, 'lease_id', 'lease_until_ms')
+    redis.call('RPUSH', 'payments:pending', id)
+    recovered = recovered + 1
+  end
+  redis.call('ZREM', 'payments:processing-leases', id)
+end
+
+return recovered
+`)
+
+func paymentFromPopResult(result []interface{}) (payments.Payment, bool, error) {
+	if len(result) == 0 {
+		return payments.Payment{}, false, nil
+	}
+
+	code, err := int64Value(result[0])
+	if err != nil {
+		return payments.Payment{}, false, err
+	}
+	if code == emptyPopResultCode || code == skippedPopResultCode {
+		return payments.Payment{}, false, nil
+	}
+	if code != paymentPopResultCode {
+		return payments.Payment{}, false, fmt.Errorf("unknown pop result code %d", code)
+	}
+	if len(result) != 6 {
+		return payments.Payment{}, false, fmt.Errorf("invalid pop result length %d", len(result))
+	}
+
+	amount, err := strconv.ParseInt(stringValue(result[2]), 10, 64)
+	if err != nil {
+		return payments.Payment{}, false, err
+	}
+	requestedAt, err := time.Parse(time.RFC3339Nano, stringValue(result[3]))
+	if err != nil {
+		return payments.Payment{}, false, err
+	}
+
+	return payments.Payment{
+		CorrelationID:    stringValue(result[1]),
+		AmountCents:      amount,
+		RequestedAt:      requestedAt.UTC(),
+		LeaseID:          stringValue(result[4]),
+		ProcessorAttempt: payments.ProcessorName(stringValue(result[5])),
+	}, true, nil
+}
+
+func int64Value(value interface{}) (int64, error) {
+	switch v := value.(type) {
+	case int64:
+		return v, nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(v), 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected integer value %T", value)
+	}
+}
+
+func stringValue(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return fmt.Sprint(v)
+	}
+}
