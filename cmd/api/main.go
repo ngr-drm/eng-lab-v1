@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	apphttp "payment-processor-fbk/internal/http"
-	"payment-processor-fbk/internal/payments"
-	"payment-processor-fbk/internal/processor"
-	"payment-processor-fbk/internal/store"
+	apphttp "eng-lab-v1/internal/http"
+	"eng-lab-v1/internal/payments"
+	"eng-lab-v1/internal/processor"
+	"eng-lab-v1/internal/store"
 )
 
 func main() {

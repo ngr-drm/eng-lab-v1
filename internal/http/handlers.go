@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"payment-processor-fbk/internal/payments"
+	"eng-lab-v1/internal/payments"
 )
 
 type Service interface {

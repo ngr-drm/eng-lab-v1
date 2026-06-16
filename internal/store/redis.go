@@ -8,8 +8,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"payment-processor-fbk/internal/payments"
-	"payment-processor-fbk/internal/processor"
+	"eng-lab-v1/internal/payments"
+	"eng-lab-v1/internal/processor"
 )
 
 type RedisConfig struct {

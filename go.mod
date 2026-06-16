@@ -1,4 +1,4 @@
-module payment-processor-fbk
+module eng-lab-v1
 
 go 1.24
 

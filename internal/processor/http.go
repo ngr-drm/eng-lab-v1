@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"payment-processor-fbk/internal/payments"
+	"eng-lab-v1/internal/payments"
 )
 
 type Config struct {
