@@ -132,7 +132,7 @@ func configFromEnv() config {
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
-		fallbackQueueSize: int64(envInt("FALLBACK_QUEUE_SIZE", 2500)),
+		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 2500)),
 	}
 }
 
@@ -150,6 +150,18 @@ func envInt(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envIntAllowZero(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
 		return fallback
 	}
 	return parsed
