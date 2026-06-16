@@ -108,7 +108,7 @@ type config struct {
 	defaultURL        string
 	fallbackURL       string
 	processorTimeout  time.Duration
-	processingLease    time.Duration
+	processingLease   time.Duration
 	healthGrace       time.Duration
 	maxProcessorConns int
 	workerCount       int
