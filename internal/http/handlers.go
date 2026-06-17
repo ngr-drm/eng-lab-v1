@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -40,6 +41,11 @@ func (h Handler) payments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := strings.TrimSpace(input.CorrelationID)
+	if correlationID == "" {
+		http.Error(w, "invalid correlationId", http.StatusBadRequest)
+		return
+	}
+
 	amount, err := payments.ParseCents(input.Amount.String())
 	if err != nil {
 		http.Error(w, "invalid amount", http.StatusBadRequest)
@@ -53,6 +59,10 @@ func (h Handler) payments(w http.ResponseWriter, r *http.Request) {
 		RequestedAt:   requestedAt,
 	})
 	if err != nil {
+		if errors.Is(err, payments.ErrQueueFull) {
+			http.Error(w, "queue full", http.StatusTooManyRequests)
+			return
+		}
 		h.logger.Warn("failed to accept payment", "err", err)
 		http.Error(w, "payment not accepted", http.StatusServiceUnavailable)
 		return

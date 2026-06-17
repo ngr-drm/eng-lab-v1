@@ -58,7 +58,16 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 	if err != nil {
 		return false, err
 	}
-	return result == 1, nil
+	switch result {
+	case 1:
+		return true, nil
+	case 0:
+		return false, nil
+	case -1:
+		return false, payments.ErrQueueFull
+	default:
+		return false, fmt.Errorf("unexpected enqueue result %d", result)
+	}
 }
 
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
@@ -93,6 +102,19 @@ func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredPro
 
 func (r *Redis) PendingDepth(ctx context.Context) (int64, error) {
 	return r.client.LLen(ctx, pendingQueueKey).Result()
+}
+
+func (r *Redis) QueueDepth(ctx context.Context) (payments.QueueDepth, error) {
+	pipe := r.client.Pipeline()
+	pending := pipe.LLen(ctx, pendingQueueKey)
+	processing := pipe.ZCard(ctx, processingLeasesKey)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return payments.QueueDepth{}, err
+	}
+	return payments.QueueDepth{
+		Pending:    pending.Val(),
+		Processing: processing.Val(),
+	}, nil
 }
 
 func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay time.Duration) error {
@@ -269,6 +291,7 @@ func (r *Redis) aggregateBucket(ctx context.Context, processor payments.Processo
 
 const (
 	pendingQueueKey      = "payments:pending"
+	processingLeasesKey = "payments:processing-leases"
 	emptyPopResultCode   = int64(0)
 	paymentPopResultCode = int64(1)
 	skippedPopResultCode = int64(2)
@@ -297,14 +320,15 @@ func processorHealthLockKey(processor payments.ProcessorName) string {
 var enqueueScript = redis.NewScript(`
 local key = 'payment:' .. ARGV[1]
 local queue = 'payments:pending'
+local processing = 'payments:processing-leases'
 local max_queue_depth = tonumber(ARGV[5])
 
 if redis.call('EXISTS', key) == 1 then
   return 0
 end
 
-if max_queue_depth > 0 and redis.call('LLEN', queue) >= max_queue_depth then
-  return redis.error_reply('queue is full')
+if max_queue_depth > 0 and (redis.call('LLEN', queue) + redis.call('ZCARD', processing)) >= max_queue_depth then
+  return -1
 end
 
 redis.call('HSET', key,

@@ -15,12 +15,23 @@ const (
 	ProcessorFallback ProcessorName = "fallback"
 )
 
+var ErrQueueFull = errors.New("queue is full")
+
 type Payment struct {
 	CorrelationID    string
 	AmountCents      int64
 	RequestedAt      time.Time
 	LeaseID          string
 	ProcessorAttempt ProcessorName
+}
+
+type QueueDepth struct {
+	Pending    int64
+	Processing int64
+}
+
+func (q QueueDepth) Total() int64 {
+	return q.Pending + q.Processing
 }
 
 type ConfirmedPayment struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,6 +14,7 @@ type Store interface {
 	RecoverProcessing(ctx context.Context) error
 	PopPending(ctx context.Context, wait time.Duration, preferredProcessor ProcessorName) (Payment, bool, error)
 	PendingDepth(ctx context.Context) (int64, error)
+	QueueDepth(ctx context.Context) (QueueDepth, error)
 	Requeue(ctx context.Context, payment Payment, delay time.Duration) error
 	Confirm(ctx context.Context, payment Payment, processor ProcessorName) (bool, error)
 	Summary(ctx context.Context, from, to *time.Time) (Summary, error)
@@ -46,6 +48,7 @@ type Service struct {
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
+	metrics           serviceMetrics
 	startOnce         sync.Once
 }
 
@@ -81,7 +84,19 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 	if payment.RequestedAt.IsZero() {
 		payment.RequestedAt = time.Now().UTC()
 	}
-	return s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
+	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
+	if err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			s.metrics.queueFull.Add(1)
+		}
+		return false, err
+	}
+	if enqueued {
+		s.metrics.enqueued.Add(1)
+	} else {
+		s.metrics.duplicates.Add(1)
+	}
+	return enqueued, nil
 }
 
 func (s *Service) Summary(ctx context.Context, from, to *time.Time) (Summary, error) {
@@ -91,6 +106,7 @@ func (s *Service) Summary(ctx context.Context, from, to *time.Time) (Summary, er
 func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		go s.recoverLoop(ctx)
+		go s.metricsLoop(ctx)
 		for i := 0; i < s.workerCount; i++ {
 			go s.worker(ctx, i)
 		}
@@ -149,19 +165,27 @@ func (s *Service) processOne(ctx context.Context, workerID int, payment Payment)
 		return
 	}
 
-	if err := proc.Process(ctx, payment); err == nil {
+	startedAt := time.Now()
+	err := proc.Process(ctx, payment)
+	s.metrics.observeProcessor(proc.Name(), time.Since(startedAt))
+
+	if err == nil {
 		confirmed, confirmErr := s.store.Confirm(ctx, payment, proc.Name())
 		if confirmErr != nil {
+			s.metrics.confirmFailures.Add(1)
 			s.logger.Error("payment confirmed remotely but local confirmation failed", "worker", workerID, "processor", proc.Name(), "correlationId", payment.CorrelationID, "err", confirmErr)
 			_ = s.store.Requeue(context.Background(), payment, s.retryDelay)
 			return
 		}
 		if confirmed {
+			s.metrics.confirmed(proc.Name())
 			return
 		}
+		s.metrics.confirmFailures.Add(1)
 		return
 	}
 
+	s.metrics.retries.Add(1)
 	if err := s.store.Requeue(ctx, payment, s.retryDelay); err != nil {
 		s.logger.Warn("failed to requeue payment", "worker", workerID, "correlationId", payment.CorrelationID, "err", err)
 	}
@@ -203,4 +227,91 @@ func (s *Service) shouldShedToFallback(ctx context.Context) bool {
 		return false
 	}
 	return depth >= s.fallbackQueueSize
+}
+
+func (s *Service) metricsLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.logMetrics(ctx)
+		}
+	}
+}
+
+func (s *Service) logMetrics(ctx context.Context) {
+	depth, err := s.store.QueueDepth(ctx)
+	if err != nil {
+		s.logger.Warn("failed to read queue metrics", "err", err)
+		return
+	}
+
+	s.logger.Info("payments metrics",
+		"pending_depth", depth.Pending,
+		"processing_depth", depth.Processing,
+		"in_flight", depth.Total(),
+		"enqueued_total", s.metrics.enqueued.Load(),
+		"duplicates_total", s.metrics.duplicates.Load(),
+		"queue_full_total", s.metrics.queueFull.Load(),
+		"confirmed_default_total", s.metrics.confirmedDefault.Load(),
+		"confirmed_fallback_total", s.metrics.confirmedFallback.Load(),
+		"retries_total", s.metrics.retries.Load(),
+		"confirm_failures_total", s.metrics.confirmFailures.Load(),
+		"processor_default_avg_ms", s.metrics.avgProcessorMS(ProcessorDefault),
+		"processor_fallback_avg_ms", s.metrics.avgProcessorMS(ProcessorFallback),
+	)
+}
+
+type serviceMetrics struct {
+	enqueued                atomic.Int64
+	duplicates              atomic.Int64
+	queueFull               atomic.Int64
+	confirmedDefault        atomic.Int64
+	confirmedFallback       atomic.Int64
+	retries                 atomic.Int64
+	confirmFailures         atomic.Int64
+	processorDefaultCalls   atomic.Int64
+	processorDefaultNanos   atomic.Int64
+	processorFallbackCalls  atomic.Int64
+	processorFallbackNanos  atomic.Int64
+}
+
+func (m *serviceMetrics) confirmed(processor ProcessorName) {
+	switch processor {
+	case ProcessorDefault:
+		m.confirmedDefault.Add(1)
+	case ProcessorFallback:
+		m.confirmedFallback.Add(1)
+	}
+}
+
+func (m *serviceMetrics) observeProcessor(processor ProcessorName, duration time.Duration) {
+	switch processor {
+	case ProcessorDefault:
+		m.processorDefaultCalls.Add(1)
+		m.processorDefaultNanos.Add(duration.Nanoseconds())
+	case ProcessorFallback:
+		m.processorFallbackCalls.Add(1)
+		m.processorFallbackNanos.Add(duration.Nanoseconds())
+	}
+}
+
+func (m *serviceMetrics) avgProcessorMS(processor ProcessorName) int64 {
+	var calls, nanos int64
+	switch processor {
+	case ProcessorDefault:
+		calls = m.processorDefaultCalls.Load()
+		nanos = m.processorDefaultNanos.Load()
+	case ProcessorFallback:
+		calls = m.processorFallbackCalls.Load()
+		nanos = m.processorFallbackNanos.Load()
+	}
+	if calls == 0 {
+		return 0
+	}
+	return (nanos / calls) / int64(time.Millisecond)
 }
