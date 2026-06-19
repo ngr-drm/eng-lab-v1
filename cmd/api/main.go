@@ -124,15 +124,15 @@ func configFromEnv() config {
 		redisAddr:         envString("REDIS_ADDR", "valkey:6379"),
 		defaultURL:        envString("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
 		fallbackURL:       envString("PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
-		processorTimeout:  envDurationMS("PROCESSOR_TIMEOUT_MS", 11*time.Second),
-		processingLease:   envDurationMS("PROCESSING_LEASE_MS", 15*time.Second),
+		processorTimeout:  envDurationMS("PROCESSOR_TIMEOUT_MS", 10*time.Second),
+		processingLease:   envDurationMS("PROCESSING_LEASE_MS", 25*time.Second),
 		healthGrace:       envDurationMS("PROCESSOR_HEALTH_GRACE_MS", 1200*time.Millisecond),
 		maxProcessorConns: envInt("MAX_PROCESSOR_CONNS", 64),
-		workerCount:       envInt("WORKERS", 24),
+		workerCount:       envInt("WORKERS", 20),
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
-		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 2500)),
+		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
 	}
 }
 

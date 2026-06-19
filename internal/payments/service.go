@@ -230,7 +230,7 @@ func (s *Service) shouldShedToFallback(ctx context.Context) bool {
 }
 
 func (s *Service) metricsLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -255,14 +255,7 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"processing_depth", depth.Processing,
 		"in_flight", depth.Total(),
 		"enqueued_total", s.metrics.enqueued.Load(),
-		"duplicates_total", s.metrics.duplicates.Load(),
-		"queue_full_total", s.metrics.queueFull.Load(),
-		"confirmed_default_total", s.metrics.confirmedDefault.Load(),
-		"confirmed_fallback_total", s.metrics.confirmedFallback.Load(),
 		"retries_total", s.metrics.retries.Load(),
-		"confirm_failures_total", s.metrics.confirmFailures.Load(),
-		"processor_default_avg_ms", s.metrics.avgProcessorMS(ProcessorDefault),
-		"processor_fallback_avg_ms", s.metrics.avgProcessorMS(ProcessorFallback),
 	)
 }
 
