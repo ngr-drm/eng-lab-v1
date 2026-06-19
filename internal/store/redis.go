@@ -117,6 +117,21 @@ func (r *Redis) QueueDepth(ctx context.Context) (payments.QueueDepth, error) {
 	}, nil
 }
 
+func (r *Redis) ProcessorCoolingDown(ctx context.Context, processor payments.ProcessorName) (bool, error) {
+	result, err := r.client.Exists(ctx, processorCooldownKey(processor)).Result()
+	if err != nil {
+		return false, err
+	}
+	return result > 0, nil
+}
+
+func (r *Redis) MarkProcessorCooldown(ctx context.Context, processor payments.ProcessorName, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	return r.client.Set(ctx, processorCooldownKey(processor), "1", ttl).Err()
+}
+
 func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay time.Duration) error {
 	if delay > 0 {
 		timer := time.NewTimer(delay)
@@ -315,6 +330,10 @@ func processorHealthKey(processor payments.ProcessorName) string {
 
 func processorHealthLockKey(processor payments.ProcessorName) string {
 	return "processor:health-lock:" + string(processor)
+}
+
+func processorCooldownKey(processor payments.ProcessorName) string {
+	return "processor:cooldown:" + string(processor)
 }
 
 var enqueueScript = redis.NewScript(`

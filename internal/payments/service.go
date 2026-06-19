@@ -15,6 +15,8 @@ type Store interface {
 	PopPending(ctx context.Context, wait time.Duration, preferredProcessor ProcessorName) (Payment, bool, error)
 	PendingDepth(ctx context.Context) (int64, error)
 	QueueDepth(ctx context.Context) (QueueDepth, error)
+	ProcessorCoolingDown(ctx context.Context, processor ProcessorName) (bool, error)
+	MarkProcessorCooldown(ctx context.Context, processor ProcessorName, ttl time.Duration) error
 	Requeue(ctx context.Context, payment Payment, delay time.Duration) error
 	Confirm(ctx context.Context, payment Payment, processor ProcessorName) (bool, error)
 	Summary(ctx context.Context, from, to *time.Time) (Summary, error)
@@ -34,6 +36,7 @@ type ServiceConfig struct {
 	WorkerCount       int
 	QueueWait         time.Duration
 	RetryDelay        time.Duration
+	ProcessorCooldown time.Duration
 	MaxQueueDepth     int64
 	FallbackQueueSize int64
 }
@@ -46,6 +49,7 @@ type Service struct {
 	workerCount       int
 	queueWait         time.Duration
 	retryDelay        time.Duration
+	processorCooldown time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
 	metrics           serviceMetrics
@@ -61,6 +65,10 @@ func NewService(cfg ServiceConfig) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	processorCooldown := cfg.ProcessorCooldown
+	if processorCooldown <= 0 {
+		processorCooldown = 700 * time.Millisecond
+	}
 	return &Service{
 		store:             cfg.Store,
 		defaultProcessor:  cfg.DefaultProcessor,
@@ -69,6 +77,7 @@ func NewService(cfg ServiceConfig) *Service {
 		workerCount:       workerCount,
 		queueWait:         cfg.QueueWait,
 		retryDelay:        cfg.RetryDelay,
+		processorCooldown: processorCooldown,
 		maxQueueDepth:     cfg.MaxQueueDepth,
 		fallbackQueueSize: cfg.FallbackQueueSize,
 	}
@@ -186,25 +195,49 @@ func (s *Service) processOne(ctx context.Context, workerID int, payment Payment)
 	}
 
 	s.metrics.retries.Add(1)
+	s.markProcessorCooldown(ctx, proc.Name(), err)
 	if err := s.store.Requeue(ctx, payment, s.retryDelay); err != nil {
 		s.logger.Warn("failed to requeue payment", "worker", workerID, "correlationId", payment.CorrelationID, "err", err)
 	}
 }
 
 func (s *Service) selectNewProcessor(ctx context.Context) ProcessorName {
-	defaultHealthy := s.defaultProcessor.Healthy(ctx)
-	fallbackHealthy := s.fallbackProcessor.Healthy(ctx)
+	defaultAvailable := s.processorAvailable(ctx, s.defaultProcessor)
+	fallbackAvailable := s.processorAvailable(ctx, s.fallbackProcessor)
 
-	if defaultHealthy {
-		if fallbackHealthy && s.shouldShedToFallback(ctx) {
+	if defaultAvailable {
+		if fallbackAvailable && s.shouldShedToFallback(ctx) {
 			return ProcessorFallback
 		}
 		return ProcessorDefault
 	}
-	if fallbackHealthy {
+	if fallbackAvailable {
 		return ProcessorFallback
 	}
 	return ProcessorDefault
+}
+
+func (s *Service) processorAvailable(ctx context.Context, proc Processor) bool {
+	if !proc.Healthy(ctx) {
+		return false
+	}
+	coolingDown, err := s.store.ProcessorCoolingDown(ctx, proc.Name())
+	if err != nil {
+		s.logger.Warn("failed to read processor cooldown", "processor", proc.Name(), "err", err)
+		return true
+	}
+	return !coolingDown
+}
+
+func (s *Service) markProcessorCooldown(ctx context.Context, processor ProcessorName, cause error) {
+	if s.processorCooldown <= 0 {
+		return
+	}
+	if err := s.store.MarkProcessorCooldown(ctx, processor, s.processorCooldown); err != nil {
+		s.logger.Warn("failed to mark processor cooldown", "processor", processor, "cause", cause, "err", err)
+		return
+	}
+	s.metrics.processorCooldown(processor)
 }
 
 func (s *Service) processorByName(name ProcessorName) Processor {
@@ -256,6 +289,8 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"in_flight", depth.Total(),
 		"enqueued_total", s.metrics.enqueued.Load(),
 		"retries_total", s.metrics.retries.Load(),
+		"cooldown_default_total", s.metrics.cooldownDefault.Load(),
+		"cooldown_fallback_total", s.metrics.cooldownFallback.Load(),
 	)
 }
 
@@ -271,6 +306,8 @@ type serviceMetrics struct {
 	processorDefaultNanos   atomic.Int64
 	processorFallbackCalls  atomic.Int64
 	processorFallbackNanos  atomic.Int64
+	cooldownDefault         atomic.Int64
+	cooldownFallback        atomic.Int64
 }
 
 func (m *serviceMetrics) confirmed(processor ProcessorName) {
@@ -290,6 +327,15 @@ func (m *serviceMetrics) observeProcessor(processor ProcessorName, duration time
 	case ProcessorFallback:
 		m.processorFallbackCalls.Add(1)
 		m.processorFallbackNanos.Add(duration.Nanoseconds())
+	}
+}
+
+func (m *serviceMetrics) processorCooldown(processor ProcessorName) {
+	switch processor {
+	case ProcessorDefault:
+		m.cooldownDefault.Add(1)
+	case ProcessorFallback:
+		m.cooldownFallback.Add(1)
 	}
 }
 
