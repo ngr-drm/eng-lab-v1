@@ -285,6 +285,7 @@ func (s *Service) logMetrics(ctx context.Context) {
 
 	s.logger.Info("payments metrics",
 		"pending_depth", depth.Pending,
+		"leasing_depth", depth.Leasing,
 		"processing_depth", depth.Processing,
 		"in_flight", depth.Total(),
 		"enqueued_total", s.metrics.enqueued.Load(),

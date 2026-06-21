@@ -73,9 +73,22 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
 	deadline := time.Now().Add(wait)
 	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return payments.Payment{}, false, nil
+		}
+
+		id, err := r.client.BRPopLPush(ctx, pendingQueueKey, leasingQueueKey, remaining).Result()
+		if err != nil {
+			if err == redis.Nil {
+				return payments.Payment{}, false, nil
+			}
+			return payments.Payment{}, false, err
+		}
+
 		now := time.Now()
-		result, err := popPendingScript.Run(ctx, r.client, nil,
-			now.UTC().UnixMilli(),
+		result, err := leasePendingScript.Run(ctx, r.client, nil,
+			id,
 			now.Add(r.processingLease).UTC().UnixMilli(),
 			string(preferredProcessor),
 		).Slice()
@@ -89,14 +102,6 @@ func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredPro
 		if !deadline.After(time.Now()) {
 			return payments.Payment{}, false, nil
 		}
-
-		timer := time.NewTimer(20 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return payments.Payment{}, false, ctx.Err()
-		case <-timer.C:
-		}
 	}
 }
 
@@ -107,12 +112,14 @@ func (r *Redis) PendingDepth(ctx context.Context) (int64, error) {
 func (r *Redis) QueueDepth(ctx context.Context) (payments.QueueDepth, error) {
 	pipe := r.client.Pipeline()
 	pending := pipe.LLen(ctx, pendingQueueKey)
+	leasing := pipe.LLen(ctx, leasingQueueKey)
 	processing := pipe.ZCard(ctx, processingLeasesKey)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return payments.QueueDepth{}, err
 	}
 	return payments.QueueDepth{
 		Pending:    pending.Val(),
+		Leasing:    leasing.Val(),
 		Processing: processing.Val(),
 	}, nil
 }
@@ -146,6 +153,14 @@ func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay tim
 }
 
 func (r *Redis) RecoverProcessing(ctx context.Context) error {
+	for recovered := 1; recovered > 0; {
+		count, err := recoverLeasingScript.Run(ctx, r.client, nil, 100).Int()
+		if err != nil {
+			return err
+		}
+		recovered = count
+	}
+
 	now := time.Now().UTC().UnixMilli()
 	for recovered := 1; recovered > 0; {
 		count, err := recoverProcessingScript.Run(ctx, r.client, nil, now, 100).Int()
@@ -306,6 +321,7 @@ func (r *Redis) aggregateBucket(ctx context.Context, processor payments.Processo
 
 const (
 	pendingQueueKey      = "payments:pending"
+	leasingQueueKey      = "payments:leasing"
 	processingLeasesKey = "payments:processing-leases"
 	emptyPopResultCode   = int64(0)
 	paymentPopResultCode = int64(1)
@@ -339,6 +355,7 @@ func processorCooldownKey(processor payments.ProcessorName) string {
 var enqueueScript = redis.NewScript(`
 local key = 'payment:' .. ARGV[1]
 local queue = 'payments:pending'
+local leasing = 'payments:leasing'
 local processing = 'payments:processing-leases'
 local max_queue_depth = tonumber(ARGV[5])
 
@@ -346,7 +363,7 @@ if redis.call('EXISTS', key) == 1 then
   return 0
 end
 
-if max_queue_depth > 0 and (redis.call('LLEN', queue) + redis.call('ZCARD', processing)) >= max_queue_depth then
+if max_queue_depth > 0 and (redis.call('LLEN', queue) + redis.call('LLEN', leasing) + redis.call('ZCARD', processing)) >= max_queue_depth then
   return -1
 end
 
@@ -356,18 +373,15 @@ redis.call('HSET', key,
   'requested_at', ARGV[4],
   'status', 'pending'
 )
-redis.call('RPUSH', queue, ARGV[1])
+redis.call('LPUSH', queue, ARGV[1])
 return 1
 `)
 
-var popPendingScript = redis.NewScript(`
-local id = redis.call('LPOP', 'payments:pending')
-if not id then
-  return {0}
-end
-
+var leasePendingScript = redis.NewScript(`
+local id = ARGV[1]
 local key = 'payment:' .. id
 if redis.call('HGET', key, 'status') ~= 'pending' then
+  redis.call('LREM', 'payments:leasing', 1, id)
   return {2}
 end
 
@@ -384,6 +398,7 @@ redis.call('HSET', key,
   'processor_attempt', processor_attempt
 )
 redis.call('ZADD', 'payments:processing-leases', ARGV[2], id)
+redis.call('LREM', 'payments:leasing', 1, id)
 return {
   1,
   id,
@@ -443,8 +458,27 @@ end
 redis.call('HSET', key, 'status', 'pending')
 redis.call('HDEL', key, 'lease_id', 'lease_until_ms')
 redis.call('ZREM', 'payments:processing-leases', ARGV[1])
-redis.call('RPUSH', 'payments:pending', ARGV[1])
+redis.call('LPUSH', 'payments:pending', ARGV[1])
 return 1
+`)
+
+var recoverLeasingScript = redis.NewScript(`
+local recovered = 0
+
+for i = 1, tonumber(ARGV[1]) do
+  local id = redis.call('LPOP', 'payments:leasing')
+  if not id then
+    break
+  end
+
+  local key = 'payment:' .. id
+  if redis.call('HGET', key, 'status') == 'pending' then
+    redis.call('LPUSH', 'payments:pending', id)
+    recovered = recovered + 1
+  end
+end
+
+return recovered
 `)
 
 var recoverProcessingScript = redis.NewScript(`
@@ -456,7 +490,7 @@ for _, id in ipairs(expired) do
   if redis.call('HGET', key, 'status') == 'processing' then
     redis.call('HSET', key, 'status', 'pending')
     redis.call('HDEL', key, 'lease_id', 'lease_until_ms')
-    redis.call('RPUSH', 'payments:pending', id)
+    redis.call('LPUSH', 'payments:pending', id)
     recovered = recovered + 1
   end
   redis.call('ZREM', 'payments:processing-leases', id)
