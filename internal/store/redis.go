@@ -322,7 +322,7 @@ func (r *Redis) aggregateBucket(ctx context.Context, processor payments.Processo
 const (
 	pendingQueueKey      = "payments:pending"
 	leasingQueueKey      = "payments:leasing"
-	processingLeasesKey = "payments:processing-leases"
+	processingLeasesKey  = "payments:processing-leases"
 	emptyPopResultCode   = int64(0)
 	paymentPopResultCode = int64(1)
 	skippedPopResultCode = int64(2)

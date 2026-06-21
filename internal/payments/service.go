@@ -296,19 +296,19 @@ func (s *Service) logMetrics(ctx context.Context) {
 }
 
 type serviceMetrics struct {
-	enqueued                atomic.Int64
-	duplicates              atomic.Int64
-	queueFull               atomic.Int64
-	confirmedDefault        atomic.Int64
-	confirmedFallback       atomic.Int64
-	retries                 atomic.Int64
-	confirmFailures         atomic.Int64
-	processorDefaultCalls   atomic.Int64
-	processorDefaultNanos   atomic.Int64
-	processorFallbackCalls  atomic.Int64
-	processorFallbackNanos  atomic.Int64
-	cooldownDefault         atomic.Int64
-	cooldownFallback        atomic.Int64
+	enqueued               atomic.Int64
+	duplicates             atomic.Int64
+	queueFull              atomic.Int64
+	confirmedDefault       atomic.Int64
+	confirmedFallback      atomic.Int64
+	retries                atomic.Int64
+	confirmFailures        atomic.Int64
+	processorDefaultCalls  atomic.Int64
+	processorDefaultNanos  atomic.Int64
+	processorFallbackCalls atomic.Int64
+	processorFallbackNanos atomic.Int64
+	cooldownDefault        atomic.Int64
+	cooldownFallback       atomic.Int64
 }
 
 func (m *serviceMetrics) confirmed(processor ProcessorName) {
