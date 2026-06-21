@@ -78,7 +78,7 @@ func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredPro
 			return payments.Payment{}, false, nil
 		}
 
-		id, err := r.client.BRPopLPush(ctx, pendingQueueKey, leasingQueueKey, remaining).Result()
+		id, err := r.client.BRPopLPush(ctx, pendingQueueKey, leasingQueueKey, redisBlockingTimeout(remaining)).Result()
 		if err != nil {
 			if err == redis.Nil {
 				return payments.Payment{}, false, nil
@@ -558,4 +558,11 @@ func stringValue(value interface{}) string {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+func redisBlockingTimeout(timeout time.Duration) time.Duration {
+	if timeout < time.Second {
+		return time.Second
+	}
+	return timeout
 }
