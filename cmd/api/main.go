@@ -59,7 +59,6 @@ func main() {
 		WorkerCount:       cfg.workerCount,
 		QueueWait:         cfg.queueWait,
 		RetryDelay:        cfg.retryDelay,
-		ProcessorCooldown: cfg.processorCooldown,
 		MaxQueueDepth:     cfg.maxQueueDepth,
 		FallbackQueueSize: cfg.fallbackQueueSize,
 	})
@@ -115,7 +114,6 @@ type config struct {
 	workerCount       int
 	queueWait         time.Duration
 	retryDelay        time.Duration
-	processorCooldown time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
 }
@@ -133,7 +131,6 @@ func configFromEnv() config {
 		workerCount:       envInt("WORKERS", 20),
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
-		processorCooldown: envDurationMS("PROCESSOR_COOLDOWN_MS", 700*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
 		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
 	}

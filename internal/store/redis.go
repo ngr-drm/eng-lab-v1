@@ -18,6 +18,7 @@ type RedisConfig struct {
 }
 
 type Redis struct {
+	acceptClient    *redis.Client
 	client          *redis.Client
 	processingLease time.Duration
 }
@@ -32,6 +33,12 @@ func NewRedis(cfg RedisConfig) *Redis {
 		processingLease = 15 * time.Second
 	}
 	return &Redis{
+		acceptClient: redis.NewClient(&redis.Options{
+			Addr:         addr,
+			PoolSize:     16,
+			MinIdleConns: 4,
+			MaxRetries:   0,
+		}),
 		client: redis.NewClient(&redis.Options{
 			Addr:         addr,
 			PoolSize:     64,
@@ -43,7 +50,11 @@ func NewRedis(cfg RedisConfig) *Redis {
 }
 
 func (r *Redis) Close() error {
-	return r.client.Close()
+	err := r.acceptClient.Close()
+	if closeErr := r.client.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, maxQueueDepth int64) (bool, error) {
@@ -54,7 +65,7 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 		payment.RequestedAt.UTC().Format(time.RFC3339Nano),
 		maxQueueDepth,
 	}
-	result, err := enqueueScript.Run(ctx, r.client, nil, values...).Int()
+	result, err := enqueueScript.Run(ctx, r.acceptClient, nil, values...).Int()
 	if err != nil {
 		return false, err
 	}
@@ -122,21 +133,6 @@ func (r *Redis) QueueDepth(ctx context.Context) (payments.QueueDepth, error) {
 		Leasing:    leasing.Val(),
 		Processing: processing.Val(),
 	}, nil
-}
-
-func (r *Redis) ProcessorCoolingDown(ctx context.Context, processor payments.ProcessorName) (bool, error) {
-	result, err := r.client.Exists(ctx, processorCooldownKey(processor)).Result()
-	if err != nil {
-		return false, err
-	}
-	return result > 0, nil
-}
-
-func (r *Redis) MarkProcessorCooldown(ctx context.Context, processor payments.ProcessorName, ttl time.Duration) error {
-	if ttl <= 0 {
-		return nil
-	}
-	return r.client.Set(ctx, processorCooldownKey(processor), "1", ttl).Err()
 }
 
 func (r *Redis) Requeue(ctx context.Context, payment payments.Payment, delay time.Duration) error {
@@ -346,10 +342,6 @@ func processorHealthKey(processor payments.ProcessorName) string {
 
 func processorHealthLockKey(processor payments.ProcessorName) string {
 	return "processor:health-lock:" + string(processor)
-}
-
-func processorCooldownKey(processor payments.ProcessorName) string {
-	return "processor:cooldown:" + string(processor)
 }
 
 var enqueueScript = redis.NewScript(`
