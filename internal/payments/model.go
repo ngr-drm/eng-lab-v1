@@ -27,12 +27,11 @@ type Payment struct {
 
 type QueueDepth struct {
 	Pending    int64
-	Leasing    int64
 	Processing int64
 }
 
 func (q QueueDepth) Total() int64 {
-	return q.Pending + q.Leasing + q.Processing
+	return q.Pending + q.Processing
 }
 
 type ConfirmedPayment struct {
