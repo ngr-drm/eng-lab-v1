@@ -78,6 +78,18 @@ func (r *Redis) PaymentExists(ctx context.Context, correlationID string) (bool, 
 	return count > 0, nil
 }
 
+func (r *Redis) DropPending(ctx context.Context, payment payments.Payment) (bool, error) {
+	result, err := dropPendingScript.Run(ctx, r.client, nil,
+		payment.CorrelationID,
+		payment.AmountCents,
+		payment.RequestedAt.UTC().UnixMilli(),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
 	deadline := time.Now().Add(wait)
 	for {
@@ -346,6 +358,30 @@ redis.call('HSET', key,
   'status', 'pending'
 )
 redis.call('RPUSH', queue, ARGV[1])
+return 1
+`)
+
+var dropPendingScript = redis.NewScript(`
+local id = ARGV[1]
+local key = 'payment:' .. id
+
+if redis.call('HGET', key, 'status') ~= 'pending' then
+  return 0
+end
+
+if redis.call('HGET', key, 'amount_cents') ~= ARGV[2] then
+  return 0
+end
+
+if redis.call('HGET', key, 'requested_at_ms') ~= ARGV[3] then
+  return 0
+end
+
+if redis.call('LREM', 'payments:pending', 1, id) == 0 then
+  return 0
+end
+
+redis.call('DEL', key)
 return 1
 `)
 

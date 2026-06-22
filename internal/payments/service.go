@@ -12,11 +12,13 @@ import (
 const (
 	defaultAcceptTimeout       = 75 * time.Millisecond
 	defaultAcceptVerifyTimeout = 25 * time.Millisecond
+	pendingDepthRefresh        = 100 * time.Millisecond
 )
 
 type Store interface {
 	EnqueuePayment(ctx context.Context, payment Payment, maxQueueDepth int64) (bool, error)
 	PaymentExists(ctx context.Context, correlationID string) (bool, error)
+	DropPending(ctx context.Context, payment Payment) (bool, error)
 	RecoverProcessing(ctx context.Context) error
 	PopPending(ctx context.Context, wait time.Duration, preferredProcessor ProcessorName) (Payment, bool, error)
 	PendingDepth(ctx context.Context) (int64, error)
@@ -58,6 +60,7 @@ type Service struct {
 	acceptVerifyTimeout time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
+	cachedPendingDepth atomic.Int64
 	metrics           serviceMetrics
 	startOnce         sync.Once
 }
@@ -105,7 +108,7 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 		payment.RequestedAt = time.Now().UTC()
 	}
 
-	acceptCtx, cancel := context.WithTimeout(context.Background(), s.acceptTimeout)
+	acceptCtx, cancel := context.WithTimeout(ctx, s.acceptTimeout)
 	defer cancel()
 
 	enqueued, err := s.store.EnqueuePayment(acceptCtx, payment, s.maxQueueDepth)
@@ -114,11 +117,21 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 			s.metrics.queueFull.Add(1)
 			return false, err
 		}
+		if ctx.Err() != nil {
+			s.metrics.acceptCanceled.Add(1)
+			s.dropCanceledAccept(payment)
+			return false, ctx.Err()
+		}
 		s.metrics.enqueueErrors.Add(1)
 		s.acceptAmbiguousEnqueue(payment.CorrelationID)
 		return true, nil
 	}
 	if enqueued {
+		if ctx.Err() != nil {
+			s.metrics.acceptCanceled.Add(1)
+			s.dropCanceledAccept(payment)
+			return false, ctx.Err()
+		}
 		s.metrics.enqueued.Add(1)
 	} else {
 		s.metrics.duplicates.Add(1)
@@ -142,6 +155,20 @@ func (s *Service) acceptAmbiguousEnqueue(correlationID string) {
 	s.metrics.acceptAssumed.Add(1)
 }
 
+func (s *Service) dropCanceledAccept(payment Payment) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.acceptVerifyTimeout)
+	defer cancel()
+
+	dropped, err := s.store.DropPending(ctx, payment)
+	if err != nil {
+		s.metrics.acceptDropErrors.Add(1)
+		return
+	}
+	if dropped {
+		s.metrics.acceptDropped.Add(1)
+	}
+}
+
 func (s *Service) Summary(ctx context.Context, from, to *time.Time) (Summary, error) {
 	return s.store.Summary(ctx, from, to)
 }
@@ -150,6 +177,10 @@ func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		go s.recoverLoop(ctx)
 		go s.metricsLoop(ctx)
+		if s.fallbackQueueSize > 0 {
+			s.refreshPendingDepth(ctx)
+			go s.pendingDepthLoop(ctx)
+		}
 		for i := 0; i < s.workerCount; i++ {
 			go s.worker(ctx, i)
 		}
@@ -171,6 +202,30 @@ func (s *Service) recoverLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (s *Service) pendingDepthLoop(ctx context.Context) {
+	ticker := time.NewTicker(pendingDepthRefresh)
+	defer ticker.Stop()
+
+	for {
+		s.refreshPendingDepth(ctx)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Service) refreshPendingDepth(ctx context.Context) {
+	depth, err := s.store.PendingDepth(ctx)
+	if err != nil {
+		s.metrics.pendingDepthReadErrors.Add(1)
+		return
+	}
+	s.cachedPendingDepth.Store(depth)
 }
 
 func (s *Service) worker(ctx context.Context, id int) {
@@ -264,12 +319,7 @@ func (s *Service) shouldShedToFallback(ctx context.Context) bool {
 	if s.fallbackQueueSize <= 0 {
 		return false
 	}
-	depth, err := s.store.PendingDepth(ctx)
-	if err != nil {
-		s.logger.Warn("failed to read pending queue depth", "err", err)
-		return false
-	}
-	return depth >= s.fallbackQueueSize
+	return s.cachedPendingDepth.Load() >= s.fallbackQueueSize
 }
 
 func (s *Service) metricsLoop(ctx context.Context) {
@@ -304,6 +354,11 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"accept_recovered_total", s.metrics.acceptRecovered.Load(),
 		"accept_unknown_total", s.metrics.acceptUnknown.Load(),
 		"accept_assumed_total", s.metrics.acceptAssumed.Load(),
+		"accept_canceled_total", s.metrics.acceptCanceled.Load(),
+		"accept_dropped_total", s.metrics.acceptDropped.Load(),
+		"accept_drop_errors_total", s.metrics.acceptDropErrors.Load(),
+		"pending_depth_cached", s.cachedPendingDepth.Load(),
+		"pending_depth_read_errors_total", s.metrics.pendingDepthReadErrors.Load(),
 		"confirmed_default_total", s.metrics.confirmedDefault.Load(),
 		"confirmed_fallback_total", s.metrics.confirmedFallback.Load(),
 		"retries_total", s.metrics.retries.Load(),
@@ -321,6 +376,10 @@ type serviceMetrics struct {
 	acceptRecovered        atomic.Int64
 	acceptUnknown          atomic.Int64
 	acceptAssumed          atomic.Int64
+	acceptCanceled         atomic.Int64
+	acceptDropped          atomic.Int64
+	acceptDropErrors       atomic.Int64
+	pendingDepthReadErrors atomic.Int64
 	confirmedDefault       atomic.Int64
 	confirmedFallback      atomic.Int64
 	retries                atomic.Int64
