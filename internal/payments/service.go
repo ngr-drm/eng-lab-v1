@@ -9,8 +9,14 @@ import (
 	"time"
 )
 
+const (
+	defaultAcceptTimeout       = 75 * time.Millisecond
+	defaultAcceptVerifyTimeout = 25 * time.Millisecond
+)
+
 type Store interface {
 	EnqueuePayment(ctx context.Context, payment Payment, maxQueueDepth int64) (bool, error)
+	PaymentExists(ctx context.Context, correlationID string) (bool, error)
 	RecoverProcessing(ctx context.Context) error
 	PopPending(ctx context.Context, wait time.Duration, preferredProcessor ProcessorName) (Payment, bool, error)
 	PendingDepth(ctx context.Context) (int64, error)
@@ -34,6 +40,8 @@ type ServiceConfig struct {
 	WorkerCount       int
 	QueueWait         time.Duration
 	RetryDelay        time.Duration
+	AcceptTimeout     time.Duration
+	AcceptVerifyTimeout time.Duration
 	MaxQueueDepth     int64
 	FallbackQueueSize int64
 }
@@ -46,6 +54,8 @@ type Service struct {
 	workerCount       int
 	queueWait         time.Duration
 	retryDelay        time.Duration
+	acceptTimeout     time.Duration
+	acceptVerifyTimeout time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
 	metrics           serviceMetrics
@@ -61,6 +71,14 @@ func NewService(cfg ServiceConfig) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	acceptTimeout := cfg.AcceptTimeout
+	if acceptTimeout <= 0 {
+		acceptTimeout = defaultAcceptTimeout
+	}
+	acceptVerifyTimeout := cfg.AcceptVerifyTimeout
+	if acceptVerifyTimeout <= 0 {
+		acceptVerifyTimeout = defaultAcceptVerifyTimeout
+	}
 	return &Service{
 		store:             cfg.Store,
 		defaultProcessor:  cfg.DefaultProcessor,
@@ -69,6 +87,8 @@ func NewService(cfg ServiceConfig) *Service {
 		workerCount:       workerCount,
 		queueWait:         cfg.QueueWait,
 		retryDelay:        cfg.RetryDelay,
+		acceptTimeout:     acceptTimeout,
+		acceptVerifyTimeout: acceptVerifyTimeout,
 		maxQueueDepth:     cfg.MaxQueueDepth,
 		fallbackQueueSize: cfg.FallbackQueueSize,
 	}
@@ -84,12 +104,19 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 	if payment.RequestedAt.IsZero() {
 		payment.RequestedAt = time.Now().UTC()
 	}
-	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
+
+	acceptCtx, cancel := context.WithTimeout(context.Background(), s.acceptTimeout)
+	defer cancel()
+
+	enqueued, err := s.store.EnqueuePayment(acceptCtx, payment, s.maxQueueDepth)
 	if err != nil {
 		if errors.Is(err, ErrQueueFull) {
 			s.metrics.queueFull.Add(1)
+			return false, err
 		}
-		return false, err
+		s.metrics.enqueueErrors.Add(1)
+		s.acceptAmbiguousEnqueue(payment.CorrelationID)
+		return true, nil
 	}
 	if enqueued {
 		s.metrics.enqueued.Add(1)
@@ -97,6 +124,22 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 		s.metrics.duplicates.Add(1)
 	}
 	return enqueued, nil
+}
+
+func (s *Service) acceptAmbiguousEnqueue(correlationID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.acceptVerifyTimeout)
+	defer cancel()
+
+	exists, err := s.store.PaymentExists(ctx, correlationID)
+	if err != nil {
+		s.metrics.acceptUnknown.Add(1)
+		return
+	}
+	if exists {
+		s.metrics.acceptRecovered.Add(1)
+		return
+	}
+	s.metrics.acceptAssumed.Add(1)
 }
 
 func (s *Service) Summary(ctx context.Context, from, to *time.Time) (Summary, error) {
@@ -255,7 +298,18 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"processing_depth", depth.Processing,
 		"in_flight", depth.Total(),
 		"enqueued_total", s.metrics.enqueued.Load(),
+		"duplicates_total", s.metrics.duplicates.Load(),
+		"queue_full_total", s.metrics.queueFull.Load(),
+		"enqueue_errors_total", s.metrics.enqueueErrors.Load(),
+		"accept_recovered_total", s.metrics.acceptRecovered.Load(),
+		"accept_unknown_total", s.metrics.acceptUnknown.Load(),
+		"accept_assumed_total", s.metrics.acceptAssumed.Load(),
+		"confirmed_default_total", s.metrics.confirmedDefault.Load(),
+		"confirmed_fallback_total", s.metrics.confirmedFallback.Load(),
 		"retries_total", s.metrics.retries.Load(),
+		"confirm_failures_total", s.metrics.confirmFailures.Load(),
+		"processor_default_avg_ms", s.metrics.avgProcessorMS(ProcessorDefault),
+		"processor_fallback_avg_ms", s.metrics.avgProcessorMS(ProcessorFallback),
 	)
 }
 
@@ -263,6 +317,10 @@ type serviceMetrics struct {
 	enqueued               atomic.Int64
 	duplicates             atomic.Int64
 	queueFull              atomic.Int64
+	enqueueErrors          atomic.Int64
+	acceptRecovered        atomic.Int64
+	acceptUnknown          atomic.Int64
+	acceptAssumed          atomic.Int64
 	confirmedDefault       atomic.Int64
 	confirmedFallback      atomic.Int64
 	retries                atomic.Int64

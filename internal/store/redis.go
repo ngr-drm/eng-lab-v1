@@ -70,6 +70,14 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 	}
 }
 
+func (r *Redis) PaymentExists(ctx context.Context, correlationID string) (bool, error) {
+	count, err := r.client.Exists(ctx, paymentKey(correlationID)).Result()
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
 	deadline := time.Now().Add(wait)
 	for {
