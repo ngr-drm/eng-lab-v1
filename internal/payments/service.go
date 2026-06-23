@@ -9,16 +9,8 @@ import (
 	"time"
 )
 
-const (
-	defaultAcceptTimeout       = 75 * time.Millisecond
-	defaultAcceptVerifyTimeout = 25 * time.Millisecond
-	pendingDepthRefresh        = 100 * time.Millisecond
-)
-
 type Store interface {
 	EnqueuePayment(ctx context.Context, payment Payment, maxQueueDepth int64) (bool, error)
-	PaymentExists(ctx context.Context, correlationID string) (bool, error)
-	DropPending(ctx context.Context, payment Payment) (bool, error)
 	RecoverProcessing(ctx context.Context) error
 	PopPending(ctx context.Context, wait time.Duration, preferredProcessor ProcessorName) (Payment, bool, error)
 	PendingDepth(ctx context.Context) (int64, error)
@@ -42,8 +34,6 @@ type ServiceConfig struct {
 	WorkerCount       int
 	QueueWait         time.Duration
 	RetryDelay        time.Duration
-	AcceptTimeout     time.Duration
-	AcceptVerifyTimeout time.Duration
 	MaxQueueDepth     int64
 	FallbackQueueSize int64
 }
@@ -56,11 +46,8 @@ type Service struct {
 	workerCount       int
 	queueWait         time.Duration
 	retryDelay        time.Duration
-	acceptTimeout     time.Duration
-	acceptVerifyTimeout time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
-	cachedPendingDepth atomic.Int64
 	metrics           serviceMetrics
 	startOnce         sync.Once
 }
@@ -74,14 +61,6 @@ func NewService(cfg ServiceConfig) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	acceptTimeout := cfg.AcceptTimeout
-	if acceptTimeout <= 0 {
-		acceptTimeout = defaultAcceptTimeout
-	}
-	acceptVerifyTimeout := cfg.AcceptVerifyTimeout
-	if acceptVerifyTimeout <= 0 {
-		acceptVerifyTimeout = defaultAcceptVerifyTimeout
-	}
 	return &Service{
 		store:             cfg.Store,
 		defaultProcessor:  cfg.DefaultProcessor,
@@ -90,8 +69,6 @@ func NewService(cfg ServiceConfig) *Service {
 		workerCount:       workerCount,
 		queueWait:         cfg.QueueWait,
 		retryDelay:        cfg.RetryDelay,
-		acceptTimeout:     acceptTimeout,
-		acceptVerifyTimeout: acceptVerifyTimeout,
 		maxQueueDepth:     cfg.MaxQueueDepth,
 		fallbackQueueSize: cfg.FallbackQueueSize,
 	}
@@ -108,65 +85,19 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 		payment.RequestedAt = time.Now().UTC()
 	}
 
-	acceptCtx, cancel := context.WithTimeout(ctx, s.acceptTimeout)
-	defer cancel()
-
-	enqueued, err := s.store.EnqueuePayment(acceptCtx, payment, s.maxQueueDepth)
+	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
 	if err != nil {
 		if errors.Is(err, ErrQueueFull) {
 			s.metrics.queueFull.Add(1)
-			return false, err
 		}
-		if ctx.Err() != nil {
-			s.metrics.acceptCanceled.Add(1)
-			s.dropCanceledAccept(payment)
-			return false, ctx.Err()
-		}
-		s.metrics.enqueueErrors.Add(1)
-		s.acceptAmbiguousEnqueue(payment.CorrelationID)
-		return true, nil
+		return false, err
 	}
 	if enqueued {
-		if ctx.Err() != nil {
-			s.metrics.acceptCanceled.Add(1)
-			s.dropCanceledAccept(payment)
-			return false, ctx.Err()
-		}
 		s.metrics.enqueued.Add(1)
 	} else {
 		s.metrics.duplicates.Add(1)
 	}
 	return enqueued, nil
-}
-
-func (s *Service) acceptAmbiguousEnqueue(correlationID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.acceptVerifyTimeout)
-	defer cancel()
-
-	exists, err := s.store.PaymentExists(ctx, correlationID)
-	if err != nil {
-		s.metrics.acceptUnknown.Add(1)
-		return
-	}
-	if exists {
-		s.metrics.acceptRecovered.Add(1)
-		return
-	}
-	s.metrics.acceptAssumed.Add(1)
-}
-
-func (s *Service) dropCanceledAccept(payment Payment) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.acceptVerifyTimeout)
-	defer cancel()
-
-	dropped, err := s.store.DropPending(ctx, payment)
-	if err != nil {
-		s.metrics.acceptDropErrors.Add(1)
-		return
-	}
-	if dropped {
-		s.metrics.acceptDropped.Add(1)
-	}
 }
 
 func (s *Service) Summary(ctx context.Context, from, to *time.Time) (Summary, error) {
@@ -177,10 +108,6 @@ func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		go s.recoverLoop(ctx)
 		go s.metricsLoop(ctx)
-		if s.fallbackQueueSize > 0 {
-			s.refreshPendingDepth(ctx)
-			go s.pendingDepthLoop(ctx)
-		}
 		for i := 0; i < s.workerCount; i++ {
 			go s.worker(ctx, i)
 		}
@@ -202,30 +129,6 @@ func (s *Service) recoverLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
-}
-
-func (s *Service) pendingDepthLoop(ctx context.Context) {
-	ticker := time.NewTicker(pendingDepthRefresh)
-	defer ticker.Stop()
-
-	for {
-		s.refreshPendingDepth(ctx)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func (s *Service) refreshPendingDepth(ctx context.Context) {
-	depth, err := s.store.PendingDepth(ctx)
-	if err != nil {
-		s.metrics.pendingDepthReadErrors.Add(1)
-		return
-	}
-	s.cachedPendingDepth.Store(depth)
 }
 
 func (s *Service) worker(ctx context.Context, id int) {
@@ -270,16 +173,13 @@ func (s *Service) processOne(ctx context.Context, workerID int, payment Payment)
 	if err == nil {
 		confirmed, confirmErr := s.store.Confirm(ctx, payment, proc.Name())
 		if confirmErr != nil {
-			s.metrics.confirmFailures.Add(1)
 			s.logger.Error("payment confirmed remotely but local confirmation failed", "worker", workerID, "processor", proc.Name(), "correlationId", payment.CorrelationID, "err", confirmErr)
 			_ = s.store.Requeue(context.Background(), payment, s.retryDelay)
 			return
 		}
 		if confirmed {
-			s.metrics.confirmed(proc.Name())
 			return
 		}
-		s.metrics.confirmFailures.Add(1)
 		return
 	}
 
@@ -319,7 +219,12 @@ func (s *Service) shouldShedToFallback(ctx context.Context) bool {
 	if s.fallbackQueueSize <= 0 {
 		return false
 	}
-	return s.cachedPendingDepth.Load() >= s.fallbackQueueSize
+	depth, err := s.store.PendingDepth(ctx)
+	if err != nil {
+		s.logger.Warn("failed to read pending queue depth", "err", err)
+		return false
+	}
+	return depth >= s.fallbackQueueSize
 }
 
 func (s *Service) metricsLoop(ctx context.Context) {
@@ -350,19 +255,7 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"enqueued_total", s.metrics.enqueued.Load(),
 		"duplicates_total", s.metrics.duplicates.Load(),
 		"queue_full_total", s.metrics.queueFull.Load(),
-		"enqueue_errors_total", s.metrics.enqueueErrors.Load(),
-		"accept_recovered_total", s.metrics.acceptRecovered.Load(),
-		"accept_unknown_total", s.metrics.acceptUnknown.Load(),
-		"accept_assumed_total", s.metrics.acceptAssumed.Load(),
-		"accept_canceled_total", s.metrics.acceptCanceled.Load(),
-		"accept_dropped_total", s.metrics.acceptDropped.Load(),
-		"accept_drop_errors_total", s.metrics.acceptDropErrors.Load(),
-		"pending_depth_cached", s.cachedPendingDepth.Load(),
-		"pending_depth_read_errors_total", s.metrics.pendingDepthReadErrors.Load(),
-		"confirmed_default_total", s.metrics.confirmedDefault.Load(),
-		"confirmed_fallback_total", s.metrics.confirmedFallback.Load(),
 		"retries_total", s.metrics.retries.Load(),
-		"confirm_failures_total", s.metrics.confirmFailures.Load(),
 		"processor_default_avg_ms", s.metrics.avgProcessorMS(ProcessorDefault),
 		"processor_fallback_avg_ms", s.metrics.avgProcessorMS(ProcessorFallback),
 	)
@@ -372,31 +265,11 @@ type serviceMetrics struct {
 	enqueued               atomic.Int64
 	duplicates             atomic.Int64
 	queueFull              atomic.Int64
-	enqueueErrors          atomic.Int64
-	acceptRecovered        atomic.Int64
-	acceptUnknown          atomic.Int64
-	acceptAssumed          atomic.Int64
-	acceptCanceled         atomic.Int64
-	acceptDropped          atomic.Int64
-	acceptDropErrors       atomic.Int64
-	pendingDepthReadErrors atomic.Int64
-	confirmedDefault       atomic.Int64
-	confirmedFallback      atomic.Int64
 	retries                atomic.Int64
-	confirmFailures        atomic.Int64
 	processorDefaultCalls  atomic.Int64
 	processorDefaultNanos  atomic.Int64
 	processorFallbackCalls atomic.Int64
 	processorFallbackNanos atomic.Int64
-}
-
-func (m *serviceMetrics) confirmed(processor ProcessorName) {
-	switch processor {
-	case ProcessorDefault:
-		m.confirmedDefault.Add(1)
-	case ProcessorFallback:
-		m.confirmedFallback.Add(1)
-	}
 }
 
 func (m *serviceMetrics) observeProcessor(processor ProcessorName, duration time.Duration) {
