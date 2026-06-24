@@ -61,6 +61,10 @@ func main() {
 		RetryDelay:        cfg.retryDelay,
 		MaxQueueDepth:     cfg.maxQueueDepth,
 		FallbackQueueSize: cfg.fallbackQueueSize,
+		IngressEnabled:    cfg.ingressEnabled,
+		IngressQueueSize:  cfg.ingressQueueSize,
+		IngressFlushers:   cfg.ingressFlushers,
+		IngressTimeout:    cfg.ingressTimeout,
 	})
 
 	service.Start(ctx)
@@ -116,6 +120,10 @@ type config struct {
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
+	ingressEnabled    bool
+	ingressQueueSize  int
+	ingressFlushers   int
+	ingressTimeout    time.Duration
 }
 
 func configFromEnv() config {
@@ -133,6 +141,10 @@ func configFromEnv() config {
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
 		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
+		ingressEnabled:    envBool("INGRESS_QUEUE_ENABLED", false),
+		ingressQueueSize:  envInt("INGRESS_QUEUE_SIZE", 2000),
+		ingressFlushers:   envInt("INGRESS_FLUSHERS", 4),
+		ingressTimeout:    envDurationMS("INGRESS_ENQUEUE_TIMEOUT_MS", 250*time.Millisecond),
 	}
 }
 
@@ -162,6 +174,18 @@ func envIntAllowZero(key string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
 		return fallback
 	}
 	return parsed

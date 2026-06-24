@@ -27,6 +27,10 @@ services:
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
+      INGRESS_QUEUE_ENABLED: "true"
+      INGRESS_QUEUE_SIZE: "2000"
+      INGRESS_FLUSHERS: "4"
+      INGRESS_ENQUEUE_TIMEOUT_MS: "250"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
@@ -51,6 +55,10 @@ services:
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
+      INGRESS_QUEUE_ENABLED: "true"
+      INGRESS_QUEUE_SIZE: "2000"
+      INGRESS_FLUSHERS: "4"
+      INGRESS_ENQUEUE_TIMEOUT_MS: "250"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
