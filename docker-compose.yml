@@ -19,46 +19,48 @@ services:
   api1:
     build: .
     environment:
+      APP_ROLE: "api"
       LISTEN_ADDR: ":8080"
       REDIS_ADDR: "valkey:6379"
-      WORKERS: "20"
-      MAX_PROCESSOR_CONNS: "48"
-      PROCESSOR_TIMEOUT_MS: "10000"
-      PROCESSING_LEASE_MS: "25000"
-      PROCESSOR_HEALTH_GRACE_MS: "1200"
-      FALLBACK_QUEUE_SIZE: "200"
-      INGRESS_QUEUE_ENABLED: "true"
-      INGRESS_QUEUE_SIZE: "2000"
-      INGRESS_FLUSHERS: "4"
-      INGRESS_ENQUEUE_TIMEOUT_MS: "250"
-      PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
-      PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
+      MAX_QUEUE_DEPTH: "18000"
     depends_on:
       - valkey
     networks:
       - backend
-      - payment-processor
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "80MB"
+          cpus: "0.24"
+          memory: "52MB"
 
   api2:
     build: .
     environment:
+      APP_ROLE: "api"
       LISTEN_ADDR: ":8080"
       REDIS_ADDR: "valkey:6379"
-      WORKERS: "20"
-      MAX_PROCESSOR_CONNS: "48"
+      MAX_QUEUE_DEPTH: "18000"
+    depends_on:
+      - valkey
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.24"
+          memory: "52MB"
+
+  worker:
+    build: .
+    environment:
+      APP_ROLE: "worker"
+      REDIS_ADDR: "valkey:6379"
+      WORKERS: "32"
+      MAX_PROCESSOR_CONNS: "64"
       PROCESSOR_TIMEOUT_MS: "10000"
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
-      INGRESS_QUEUE_ENABLED: "true"
-      INGRESS_QUEUE_SIZE: "2000"
-      INGRESS_FLUSHERS: "4"
-      INGRESS_ENQUEUE_TIMEOUT_MS: "250"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
@@ -69,8 +71,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "80MB"
+          cpus: "0.42"
+          memory: "64MB"
 
   valkey:
     image: valkey/valkey:8.1-alpine

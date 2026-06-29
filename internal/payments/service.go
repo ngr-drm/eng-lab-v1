@@ -36,10 +36,6 @@ type ServiceConfig struct {
 	RetryDelay        time.Duration
 	MaxQueueDepth     int64
 	FallbackQueueSize int64
-	IngressEnabled    bool
-	IngressQueueSize  int
-	IngressFlushers   int
-	IngressTimeout    time.Duration
 }
 
 type Service struct {
@@ -52,10 +48,6 @@ type Service struct {
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
-	ingressEnabled    bool
-	ingressQueue      chan Payment
-	ingressFlushers   int
-	ingressTimeout    time.Duration
 	metrics           serviceMetrics
 	startOnce         sync.Once
 }
@@ -69,20 +61,8 @@ func NewService(cfg ServiceConfig) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	ingressQueueSize := cfg.IngressQueueSize
-	if ingressQueueSize <= 0 {
-		ingressQueueSize = 2000
-	}
-	ingressFlushers := cfg.IngressFlushers
-	if ingressFlushers <= 0 {
-		ingressFlushers = 4
-	}
-	ingressTimeout := cfg.IngressTimeout
-	if ingressTimeout <= 0 {
-		ingressTimeout = 250 * time.Millisecond
-	}
 
-	service := &Service{
+	return &Service{
 		store:             cfg.Store,
 		defaultProcessor:  cfg.DefaultProcessor,
 		fallbackProcessor: cfg.FallbackProcessor,
@@ -92,14 +72,7 @@ func NewService(cfg ServiceConfig) *Service {
 		retryDelay:        cfg.RetryDelay,
 		maxQueueDepth:     cfg.MaxQueueDepth,
 		fallbackQueueSize: cfg.FallbackQueueSize,
-		ingressEnabled:    cfg.IngressEnabled,
-		ingressFlushers:   ingressFlushers,
-		ingressTimeout:    ingressTimeout,
 	}
-	if cfg.IngressEnabled {
-		service.ingressQueue = make(chan Payment, ingressQueueSize)
-	}
-	return service
 }
 
 func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
@@ -113,32 +86,9 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 		payment.RequestedAt = time.Now().UTC()
 	}
 
-	if s.ingressEnabled {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		select {
-		case s.ingressQueue <- payment:
-			s.metrics.ingressAccepted.Add(1)
-			return true, nil
-		default:
-			s.metrics.ingressFull.Add(1)
-			s.metrics.queueFull.Add(1)
-			return false, ErrQueueFull
-		}
-	}
-
 	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
 	if err != nil {
-		if errors.Is(err, ErrQueueFull) {
-			s.metrics.queueFull.Add(1)
-		}
 		return false, err
-	}
-	if enqueued {
-		s.metrics.enqueued.Add(1)
-	} else {
-		s.metrics.duplicates.Add(1)
 	}
 	return enqueued, nil
 }
@@ -151,11 +101,6 @@ func (s *Service) Start(ctx context.Context) {
 	s.startOnce.Do(func() {
 		go s.recoverLoop(ctx)
 		go s.metricsLoop(ctx)
-		if s.ingressEnabled {
-			for i := 0; i < s.ingressFlushers; i++ {
-				go s.ingressFlusher(ctx)
-			}
-		}
 		for i := 0; i < s.workerCount; i++ {
 			go s.worker(ctx, i)
 		}
@@ -175,56 +120,6 @@ func (s *Service) recoverLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		}
-	}
-}
-
-func (s *Service) ingressFlusher(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case payment := <-s.ingressQueue:
-			s.flushIngressPayment(ctx, payment)
-		}
-	}
-}
-
-func (s *Service) flushIngressPayment(ctx context.Context, payment Payment) {
-	for {
-		enqueueCtx := ctx
-		var cancel context.CancelFunc
-		if s.ingressTimeout > 0 {
-			enqueueCtx, cancel = context.WithTimeout(ctx, s.ingressTimeout)
-		}
-
-		enqueued, err := s.store.EnqueuePayment(enqueueCtx, payment, s.maxQueueDepth)
-		if cancel != nil {
-			cancel()
-		}
-		if err == nil {
-			if enqueued {
-				s.metrics.enqueued.Add(1)
-			} else {
-				s.metrics.duplicates.Add(1)
-			}
-			return
-		}
-
-		if ctx.Err() != nil {
-			return
-		}
-		if errors.Is(err, ErrQueueFull) {
-			s.metrics.queueFull.Add(1)
-		}
-		s.metrics.ingressFlushRetries.Add(1)
-
-		timer := time.NewTimer(s.retryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
 		}
 	}
 }
@@ -348,30 +243,10 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"pending_depth", depth.Pending,
 		"processing_depth", depth.Processing,
 		"in_flight", depth.Total(),
-		"ingress_depth", s.ingressDepth(),
-		"enqueued_total", s.metrics.enqueued.Load(),
-		"duplicates_total", s.metrics.duplicates.Load(),
-		"queue_full_total", s.metrics.queueFull.Load(),
-		"ingress_accepted_total", s.metrics.ingressAccepted.Load(),
-		"ingress_full_total", s.metrics.ingressFull.Load(),
-		"ingress_flush_retries_total", s.metrics.ingressFlushRetries.Load(),
 		"retries_total", s.metrics.retries.Load(),
 	)
 }
 
-func (s *Service) ingressDepth() int {
-	if !s.ingressEnabled || s.ingressQueue == nil {
-		return 0
-	}
-	return len(s.ingressQueue)
-}
-
 type serviceMetrics struct {
-	enqueued            atomic.Int64
-	duplicates          atomic.Int64
-	queueFull           atomic.Int64
-	ingressAccepted     atomic.Int64
-	ingressFull         atomic.Int64
-	ingressFlushRetries atomic.Int64
-	retries             atomic.Int64
+	retries atomic.Int64
 }
