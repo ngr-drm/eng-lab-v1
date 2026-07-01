@@ -88,7 +88,16 @@ func newPaymentService(cfg config, st *store.Redis, logger *slog.Logger) *paymen
 
 func runHTTPServer(ctx context.Context, cfg config, service *payments.Service, logger *slog.Logger) {
 	mux := http.NewServeMux()
-	apphttp.Register(mux, service, logger)
+	postAckMetrics := &apphttp.PostAckMetrics{}
+	apphttp.Register(mux, service, logger, apphttp.HandlerConfig{
+		AcceptMode:        cfg.postAcceptMode,
+		AckEnqueueTimeout: cfg.postAckEnqueueTimeout,
+		PostAckMetrics:    postAckMetrics,
+	})
+
+	if cfg.postAcceptMode == apphttp.AcceptModeAckFirst {
+		go postAckMetricsLoop(ctx, logger, postAckMetrics)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.listenAddr,
@@ -104,7 +113,7 @@ func runHTTPServer(ctx context.Context, cfg config, service *payments.Service, l
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("api listening", "addr", cfg.listenAddr)
+		logger.Info("api listening", "addr", cfg.listenAddr, "post_accept_mode", cfg.postAcceptMode)
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -121,6 +130,25 @@ func runHTTPServer(ctx context.Context, cfg config, service *payments.Service, l
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown failed", "err", err)
+	}
+}
+
+func postAckMetricsLoop(ctx context.Context, logger *slog.Logger, metrics *apphttp.PostAckMetrics) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snapshot := metrics.Snapshot()
+			logger.Info("post ack metrics",
+				"post_ack_enqueued_total", snapshot.Enqueued,
+				"post_ack_enqueue_failed_total", snapshot.EnqueueFailed,
+				"post_ack_flush_failed_total", snapshot.FlushFailed,
+			)
+		}
 	}
 }
 
@@ -147,6 +175,8 @@ type config struct {
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
+	postAcceptMode          apphttp.AcceptMode
+	postAckEnqueueTimeout   time.Duration
 }
 
 func configFromEnv() config {
@@ -165,6 +195,8 @@ func configFromEnv() config {
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
 		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
+		postAcceptMode:        envAcceptMode("POST_ACCEPT_MODE", apphttp.AcceptModeDurable),
+		postAckEnqueueTimeout: envDurationMS("POST_ACK_ENQUEUE_TIMEOUT_MS", 500*time.Millisecond),
 	}
 }
 
@@ -219,6 +251,21 @@ func envRole(key string, fallback appRole) appRole {
 		return roleWorker
 	case roleAll:
 		return roleAll
+	default:
+		return fallback
+	}
+}
+
+func envAcceptMode(key string, fallback apphttp.AcceptMode) apphttp.AcceptMode {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	switch apphttp.AcceptMode(strings.ToLower(strings.TrimSpace(value))) {
+	case apphttp.AcceptModeDurable:
+		return apphttp.AcceptModeDurable
+	case apphttp.AcceptModeAckFirst:
+		return apphttp.AcceptModeAckFirst
 	default:
 		return fallback
 	}

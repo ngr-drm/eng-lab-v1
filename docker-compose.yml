@@ -23,6 +23,8 @@ services:
       LISTEN_ADDR: ":8080"
       REDIS_ADDR: "valkey:6379"
       MAX_QUEUE_DEPTH: "18000"
+      POST_ACCEPT_MODE: "ack_first"
+      POST_ACK_ENQUEUE_TIMEOUT_MS: "500"
     depends_on:
       - valkey
     networks:
@@ -40,6 +42,8 @@ services:
       LISTEN_ADDR: ":8080"
       REDIS_ADDR: "valkey:6379"
       MAX_QUEUE_DEPTH: "18000"
+      POST_ACCEPT_MODE: "ack_first"
+      POST_ACK_ENQUEUE_TIMEOUT_MS: "500"
     depends_on:
       - valkey
     networks:
@@ -55,12 +59,12 @@ services:
     environment:
       APP_ROLE: "worker"
       REDIS_ADDR: "valkey:6379"
-      WORKERS: "32"
+      WORKERS: "40"
       MAX_PROCESSOR_CONNS: "64"
       PROCESSOR_TIMEOUT_MS: "10000"
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
-      FALLBACK_QUEUE_SIZE: "200"
+      FALLBACK_QUEUE_SIZE: "400"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
