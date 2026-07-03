@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -31,49 +30,28 @@ func main() {
 	})
 	defer st.Close()
 
-	service := newPaymentService(cfg, st, logger)
-	if cfg.runsWorkers() {
-		service.Start(ctx)
-		logger.Info("payment workers started", "workers", cfg.workerCount, "role", cfg.role)
-	}
+	defaultProcessor := processor.NewHTTPClient(processor.Config{
+		Name:        payments.ProcessorDefault,
+		BaseURL:     cfg.defaultURL,
+		Timeout:     cfg.processorTimeout,
+		MaxConns:    cfg.maxProcessorConns,
+		IdleConns:   cfg.maxProcessorConns,
+		HealthTTL:   5 * time.Second,
+		HealthGrace: cfg.healthGrace,
+		HealthCache: st,
+	})
+	fallbackProcessor := processor.NewHTTPClient(processor.Config{
+		Name:        payments.ProcessorFallback,
+		BaseURL:     cfg.fallbackURL,
+		Timeout:     cfg.processorTimeout,
+		MaxConns:    cfg.maxProcessorConns,
+		IdleConns:   cfg.maxProcessorConns,
+		HealthTTL:   5 * time.Second,
+		HealthGrace: cfg.healthGrace,
+		HealthCache: st,
+	})
 
-	if !cfg.servesHTTP() {
-		logger.Info("worker process started", "role", cfg.role)
-		<-ctx.Done()
-		return
-	}
-
-	runHTTPServer(ctx, cfg, service, logger)
-}
-
-func newPaymentService(cfg config, st *store.Redis, logger *slog.Logger) *payments.Service {
-	var defaultProcessor payments.Processor
-	var fallbackProcessor payments.Processor
-
-	if cfg.runsWorkers() {
-		defaultProcessor = processor.NewHTTPClient(processor.Config{
-			Name:        payments.ProcessorDefault,
-			BaseURL:     cfg.defaultURL,
-			Timeout:     cfg.processorTimeout,
-			MaxConns:    cfg.maxProcessorConns,
-			IdleConns:   cfg.maxProcessorConns,
-			HealthTTL:   5 * time.Second,
-			HealthGrace: cfg.healthGrace,
-			HealthCache: st,
-		})
-		fallbackProcessor = processor.NewHTTPClient(processor.Config{
-			Name:        payments.ProcessorFallback,
-			BaseURL:     cfg.fallbackURL,
-			Timeout:     cfg.processorTimeout,
-			MaxConns:    cfg.maxProcessorConns,
-			IdleConns:   cfg.maxProcessorConns,
-			HealthTTL:   5 * time.Second,
-			HealthGrace: cfg.healthGrace,
-			HealthCache: st,
-		})
-	}
-
-	return payments.NewService(payments.ServiceConfig{
+	service := payments.NewService(payments.ServiceConfig{
 		Store:             st,
 		DefaultProcessor:  defaultProcessor,
 		FallbackProcessor: fallbackProcessor,
@@ -84,20 +62,11 @@ func newPaymentService(cfg config, st *store.Redis, logger *slog.Logger) *paymen
 		MaxQueueDepth:     cfg.maxQueueDepth,
 		FallbackQueueSize: cfg.fallbackQueueSize,
 	})
-}
 
-func runHTTPServer(ctx context.Context, cfg config, service *payments.Service, logger *slog.Logger) {
+	service.Start(ctx)
+
 	mux := http.NewServeMux()
-	postAckMetrics := &apphttp.PostAckMetrics{}
-	apphttp.Register(mux, service, logger, apphttp.HandlerConfig{
-		AcceptMode:        cfg.postAcceptMode,
-		AckEnqueueTimeout: cfg.postAckEnqueueTimeout,
-		PostAckMetrics:    postAckMetrics,
-	})
-
-	if cfg.postAcceptMode == apphttp.AcceptModeAckFirst {
-		go postAckMetricsLoop(ctx, logger, postAckMetrics)
-	}
+	apphttp.Register(mux, service, logger)
 
 	server := &http.Server{
 		Addr:              cfg.listenAddr,
@@ -113,7 +82,7 @@ func runHTTPServer(ctx context.Context, cfg config, service *payments.Service, l
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("api listening", "addr", cfg.listenAddr, "post_accept_mode", cfg.postAcceptMode)
+		logger.Info("api listening", "addr", cfg.listenAddr)
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -133,35 +102,7 @@ func runHTTPServer(ctx context.Context, cfg config, service *payments.Service, l
 	}
 }
 
-func postAckMetricsLoop(ctx context.Context, logger *slog.Logger, metrics *apphttp.PostAckMetrics) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			snapshot := metrics.Snapshot()
-			logger.Info("post ack metrics",
-				"post_ack_enqueued_total", snapshot.Enqueued,
-				"post_ack_enqueue_failed_total", snapshot.EnqueueFailed,
-				"post_ack_flush_failed_total", snapshot.FlushFailed,
-			)
-		}
-	}
-}
-
-type appRole string
-
-const (
-	roleAPI    appRole = "api"
-	roleWorker appRole = "worker"
-	roleAll    appRole = "all"
-)
-
 type config struct {
-	role              appRole
 	listenAddr        string
 	redisAddr         string
 	defaultURL        string
@@ -175,13 +116,10 @@ type config struct {
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
-	postAcceptMode          apphttp.AcceptMode
-	postAckEnqueueTimeout   time.Duration
 }
 
 func configFromEnv() config {
 	return config{
-		role:              envRole("APP_ROLE", roleAll),
 		listenAddr:        envString("LISTEN_ADDR", ":8080"),
 		redisAddr:         envString("REDIS_ADDR", "valkey:6379"),
 		defaultURL:        envString("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
@@ -195,17 +133,7 @@ func configFromEnv() config {
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
 		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
-		postAcceptMode:        envAcceptMode("POST_ACCEPT_MODE", apphttp.AcceptModeDurable),
-		postAckEnqueueTimeout: envDurationMS("POST_ACK_ENQUEUE_TIMEOUT_MS", 500*time.Millisecond),
 	}
-}
-
-func (c config) runsWorkers() bool {
-	return c.role == roleWorker || c.role == roleAll
-}
-
-func (c config) servesHTTP() bool {
-	return c.role == roleAPI || c.role == roleAll
 }
 
 func envString(key, fallback string) string {
@@ -237,38 +165,6 @@ func envIntAllowZero(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
-}
-
-func envRole(key string, fallback appRole) appRole {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-	switch appRole(strings.ToLower(strings.TrimSpace(value))) {
-	case roleAPI:
-		return roleAPI
-	case roleWorker:
-		return roleWorker
-	case roleAll:
-		return roleAll
-	default:
-		return fallback
-	}
-}
-
-func envAcceptMode(key string, fallback apphttp.AcceptMode) apphttp.AcceptMode {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-	switch apphttp.AcceptMode(strings.ToLower(strings.TrimSpace(value))) {
-	case apphttp.AcceptModeDurable:
-		return apphttp.AcceptModeDurable
-	case apphttp.AcceptModeAckFirst:
-		return apphttp.AcceptModeAckFirst
-	default:
-		return fallback
-	}
 }
 
 func envDurationMS(key string, fallback time.Duration) time.Duration {

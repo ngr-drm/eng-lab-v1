@@ -61,7 +61,6 @@ func NewService(cfg ServiceConfig) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-
 	return &Service{
 		store:             cfg.Store,
 		defaultProcessor:  cfg.DefaultProcessor,
@@ -88,7 +87,15 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 
 	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
 	if err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			s.metrics.queueFull.Add(1)
+		}
 		return false, err
+	}
+	if enqueued {
+		s.metrics.enqueued.Add(1)
+	} else {
+		s.metrics.duplicates.Add(1)
 	}
 	return enqueued, nil
 }
@@ -159,7 +166,9 @@ func (s *Service) processOne(ctx context.Context, workerID int, payment Payment)
 		return
 	}
 
+	startedAt := time.Now()
 	err := proc.Process(ctx, payment)
+	s.metrics.observeProcessor(proc.Name(), time.Since(startedAt))
 
 	if err == nil {
 		confirmed, confirmErr := s.store.Confirm(ctx, payment, proc.Name())
@@ -243,10 +252,49 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"pending_depth", depth.Pending,
 		"processing_depth", depth.Processing,
 		"in_flight", depth.Total(),
+		"enqueued_total", s.metrics.enqueued.Load(),
+		"duplicates_total", s.metrics.duplicates.Load(),
+		"queue_full_total", s.metrics.queueFull.Load(),
 		"retries_total", s.metrics.retries.Load(),
+		"processor_default_avg_ms", s.metrics.avgProcessorMS(ProcessorDefault),
+		"processor_fallback_avg_ms", s.metrics.avgProcessorMS(ProcessorFallback),
 	)
 }
 
 type serviceMetrics struct {
-	retries atomic.Int64
+	enqueued               atomic.Int64
+	duplicates             atomic.Int64
+	queueFull              atomic.Int64
+	retries                atomic.Int64
+	processorDefaultCalls  atomic.Int64
+	processorDefaultNanos  atomic.Int64
+	processorFallbackCalls atomic.Int64
+	processorFallbackNanos atomic.Int64
+}
+
+func (m *serviceMetrics) observeProcessor(processor ProcessorName, duration time.Duration) {
+	switch processor {
+	case ProcessorDefault:
+		m.processorDefaultCalls.Add(1)
+		m.processorDefaultNanos.Add(duration.Nanoseconds())
+	case ProcessorFallback:
+		m.processorFallbackCalls.Add(1)
+		m.processorFallbackNanos.Add(duration.Nanoseconds())
+	}
+}
+
+func (m *serviceMetrics) avgProcessorMS(processor ProcessorName) int64 {
+	var calls, nanos int64
+	switch processor {
+	case ProcessorDefault:
+		calls = m.processorDefaultCalls.Load()
+		nanos = m.processorDefaultNanos.Load()
+	case ProcessorFallback:
+		calls = m.processorFallbackCalls.Load()
+		nanos = m.processorFallbackNanos.Load()
+	}
+	if calls == 0 {
+		return 0
+	}
+	return (nanos / calls) / int64(time.Millisecond)
 }
