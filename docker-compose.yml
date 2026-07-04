@@ -29,6 +29,7 @@ services:
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
+      ACCEPT_INFLIGHT_LIMIT: "32"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
@@ -54,6 +55,7 @@ services:
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
+      ACCEPT_INFLIGHT_LIMIT: "32"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:

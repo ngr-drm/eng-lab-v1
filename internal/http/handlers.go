@@ -7,10 +7,36 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"eng-lab-v1/internal/payments"
 )
+
+type HandlerConfig struct {
+	AcceptInFlightLimit int
+	AcceptMetrics       *AcceptMetrics
+}
+
+type AcceptMetrics struct {
+	inFlight atomic.Int64
+	shed     atomic.Int64
+}
+
+type AcceptMetricsSnapshot struct {
+	InFlight int64
+	Shed     int64
+}
+
+func (m *AcceptMetrics) Snapshot() AcceptMetricsSnapshot {
+	if m == nil {
+		return AcceptMetricsSnapshot{}
+	}
+	return AcceptMetricsSnapshot{
+		InFlight: m.inFlight.Load(),
+		Shed:     m.shed.Load(),
+	}
+}
 
 type Service interface {
 	Accept(ctx context.Context, payment payments.Payment) (bool, error)
@@ -18,12 +44,27 @@ type Service interface {
 }
 
 type Handler struct {
-	service Service
-	logger  *slog.Logger
+	service      Service
+	logger       *slog.Logger
+	acceptTokens chan struct{}
+	metrics      *AcceptMetrics
 }
 
-func Register(mux *http.ServeMux, service Service, logger *slog.Logger) {
-	handler := Handler{service: service, logger: logger}
+func Register(mux *http.ServeMux, service Service, logger *slog.Logger, cfg HandlerConfig) {
+	if cfg.AcceptMetrics == nil {
+		cfg.AcceptMetrics = &AcceptMetrics{}
+	}
+	var acceptTokens chan struct{}
+	if cfg.AcceptInFlightLimit > 0 {
+		acceptTokens = make(chan struct{}, cfg.AcceptInFlightLimit)
+	}
+
+	handler := Handler{
+		service:      service,
+		logger:       logger,
+		acceptTokens: acceptTokens,
+		metrics:      cfg.AcceptMetrics,
+	}
 	mux.HandleFunc("POST /payments", handler.payments)
 	mux.HandleFunc("GET /payments-summary", handler.summary)
 	mux.HandleFunc("GET /health", handler.health)
@@ -52,6 +93,12 @@ func (h Handler) payments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.acquireAcceptSlot() {
+		http.Error(w, "too many accepted payments in flight", http.StatusTooManyRequests)
+		return
+	}
+	defer h.releaseAcceptSlot()
+
 	requestedAt := time.Now().UTC()
 	_, err = h.service.Accept(r.Context(), payments.Payment{
 		CorrelationID: correlationID,
@@ -69,6 +116,28 @@ func (h Handler) payments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (h Handler) acquireAcceptSlot() bool {
+	if h.acceptTokens == nil {
+		return true
+	}
+	select {
+	case h.acceptTokens <- struct{}{}:
+		h.metrics.inFlight.Add(1)
+		return true
+	default:
+		h.metrics.shed.Add(1)
+		return false
+	}
+}
+
+func (h Handler) releaseAcceptSlot() {
+	if h.acceptTokens == nil {
+		return
+	}
+	<-h.acceptTokens
+	h.metrics.inFlight.Add(-1)
 }
 
 func (h Handler) summary(w http.ResponseWriter, r *http.Request) {
