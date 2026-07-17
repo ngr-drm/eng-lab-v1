@@ -66,14 +66,7 @@ func main() {
 	service.Start(ctx)
 
 	mux := http.NewServeMux()
-	acceptMetrics := &apphttp.AcceptMetrics{}
-	apphttp.Register(mux, service, logger, apphttp.HandlerConfig{
-		AcceptInFlightLimit: cfg.acceptInFlightLimit,
-		AcceptMetrics:       acceptMetrics,
-	})
-	if cfg.acceptInFlightLimit > 0 {
-		go acceptMetricsLoop(ctx, logger, acceptMetrics)
-	}
+	apphttp.Register(mux, service, logger)
 
 	server := &http.Server{
 		Addr:              cfg.listenAddr,
@@ -109,24 +102,6 @@ func main() {
 	}
 }
 
-func acceptMetricsLoop(ctx context.Context, logger *slog.Logger, metrics *apphttp.AcceptMetrics) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			snapshot := metrics.Snapshot()
-			logger.Info("accept admission metrics",
-				"accept_inflight", snapshot.InFlight,
-				"accept_shed_total", snapshot.Shed,
-			)
-		}
-	}
-}
-
 type config struct {
 	listenAddr        string
 	redisAddr         string
@@ -140,8 +115,7 @@ type config struct {
 	queueWait         time.Duration
 	retryDelay        time.Duration
 	maxQueueDepth     int64
-	fallbackQueueSize    int64
-	acceptInFlightLimit int
+	fallbackQueueSize int64
 }
 
 func configFromEnv() config {
@@ -158,8 +132,7 @@ func configFromEnv() config {
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
-		fallbackQueueSize:    int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
-		acceptInFlightLimit: envIntAllowZero("ACCEPT_INFLIGHT_LIMIT", 0),
+		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),
 	}
 }
 

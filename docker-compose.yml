@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.15"
           memory: "32MB"
 
   api1:
@@ -23,13 +23,13 @@ services:
     environment:
       LISTEN_ADDR: ":8080"
       REDIS_ADDR: "valkey:6379"
+      GOMAXPROCS: "1"
       WORKERS: "20"
-      MAX_PROCESSOR_CONNS: "48"
+      MAX_PROCESSOR_CONNS: "20"
       PROCESSOR_TIMEOUT_MS: "10000"
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
-      ACCEPT_INFLIGHT_LIMIT: "32"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
@@ -49,13 +49,13 @@ services:
     environment:
       LISTEN_ADDR: ":8080"
       REDIS_ADDR: "valkey:6379"
+      GOMAXPROCS: "1"
       WORKERS: "20"
-      MAX_PROCESSOR_CONNS: "48"
+      MAX_PROCESSOR_CONNS: "20"
       PROCESSOR_TIMEOUT_MS: "10000"
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
       FALLBACK_QUEUE_SIZE: "200"
-      ACCEPT_INFLIGHT_LIMIT: "32"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
@@ -78,7 +78,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.50"
+          cpus: "0.45"
           memory: "150MB"
 
 networks:

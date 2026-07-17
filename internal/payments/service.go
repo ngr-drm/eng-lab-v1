@@ -87,9 +87,6 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 
 	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
 	if err != nil {
-		if errors.Is(err, ErrQueueFull) {
-			s.metrics.queueFull.Add(1)
-		}
 		return false, err
 	}
 	if enqueued {
@@ -249,13 +246,11 @@ func (s *Service) logMetrics(ctx context.Context) {
 		"processing_depth", depth.Processing,
 		"in_flight", depth.Total(),
 		"enqueued_total", s.metrics.enqueued.Load(),
-		"queue_full_total", s.metrics.queueFull.Load(),
 		"retries_total", s.metrics.retries.Load(),
 	)
 }
 
 type serviceMetrics struct {
-	enqueued  atomic.Int64
-	queueFull atomic.Int64
-	retries   atomic.Int64
+	enqueued atomic.Int64
+	retries  atomic.Int64
 }
