@@ -25,8 +25,9 @@ func main() {
 
 	cfg := configFromEnv()
 	st := store.NewRedis(store.RedisConfig{
-		Addr:            cfg.redisAddr,
-		ProcessingLease: cfg.processingLease,
+		Addr:              cfg.redisAddr,
+		ProcessingLease:   cfg.processingLease,
+		QueuePollInterval: cfg.queuePoll,
 	})
 	defer st.Close()
 
@@ -113,6 +114,7 @@ type config struct {
 	maxProcessorConns int
 	workerCount       int
 	queueWait         time.Duration
+	queuePoll         time.Duration
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
@@ -130,6 +132,7 @@ func configFromEnv() config {
 		maxProcessorConns: envInt("MAX_PROCESSOR_CONNS", 64),
 		workerCount:       envInt("WORKERS", 20),
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
+		queuePoll:         envDurationMS("QUEUE_POLL_MS", 20*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
 		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),

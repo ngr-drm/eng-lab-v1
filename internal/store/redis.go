@@ -13,13 +13,15 @@ import (
 )
 
 type RedisConfig struct {
-	Addr            string
-	ProcessingLease time.Duration
+	Addr              string
+	ProcessingLease   time.Duration
+	QueuePollInterval time.Duration
 }
 
 type Redis struct {
-	client          *redis.Client
-	processingLease time.Duration
+	client            *redis.Client
+	processingLease   time.Duration
+	queuePollInterval time.Duration
 }
 
 func NewRedis(cfg RedisConfig) *Redis {
@@ -31,6 +33,10 @@ func NewRedis(cfg RedisConfig) *Redis {
 	if processingLease <= 0 {
 		processingLease = 15 * time.Second
 	}
+	queuePollInterval := cfg.QueuePollInterval
+	if queuePollInterval <= 0 {
+		queuePollInterval = 20 * time.Millisecond
+	}
 	return &Redis{
 		client: redis.NewClient(&redis.Options{
 			Addr:         addr,
@@ -38,7 +44,8 @@ func NewRedis(cfg RedisConfig) *Redis {
 			MinIdleConns: 8,
 			MaxRetries:   1,
 		}),
-		processingLease: processingLease,
+		processingLease:   processingLease,
+		queuePollInterval: queuePollInterval,
 	}
 }
 
@@ -72,6 +79,13 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
 	deadline := time.Now().Add(wait)
+	var pollTimer *time.Timer
+	defer func() {
+		if pollTimer != nil {
+			pollTimer.Stop()
+		}
+	}()
+
 	for {
 		now := time.Now()
 		result, err := popPendingScript.Run(ctx, r.client, nil,
@@ -86,16 +100,21 @@ func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredPro
 		if err != nil || ok {
 			return payment, ok, err
 		}
-		if !deadline.After(time.Now()) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return payments.Payment{}, false, nil
 		}
 
-		timer := time.NewTimer(20 * time.Millisecond)
+		pollDelay := min(r.queuePollInterval, remaining)
+		if pollTimer == nil {
+			pollTimer = time.NewTimer(pollDelay)
+		} else {
+			pollTimer.Reset(pollDelay)
+		}
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return payments.Payment{}, false, ctx.Err()
-		case <-timer.C:
+		case <-pollTimer.C:
 		}
 	}
 }
