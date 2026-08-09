@@ -25,9 +25,9 @@ func main() {
 
 	cfg := configFromEnv()
 	st := store.NewRedis(store.RedisConfig{
-		Addr:              cfg.redisAddr,
-		ProcessingLease:   cfg.processingLease,
-		QueuePollInterval: cfg.queuePoll,
+		Network:         cfg.redisNetwork,
+		Addr:            cfg.redisAddr,
+		ProcessingLease: cfg.processingLease,
 	})
 	defer st.Close()
 
@@ -105,6 +105,7 @@ func main() {
 
 type config struct {
 	listenAddr        string
+	redisNetwork      string
 	redisAddr         string
 	defaultURL        string
 	fallbackURL       string
@@ -114,7 +115,6 @@ type config struct {
 	maxProcessorConns int
 	workerCount       int
 	queueWait         time.Duration
-	queuePoll         time.Duration
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
@@ -123,6 +123,7 @@ type config struct {
 func configFromEnv() config {
 	return config{
 		listenAddr:        envString("LISTEN_ADDR", ":8080"),
+		redisNetwork:      envString("REDIS_NETWORK", "tcp"),
 		redisAddr:         envString("REDIS_ADDR", "valkey:6379"),
 		defaultURL:        envString("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
 		fallbackURL:       envString("PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
@@ -132,7 +133,6 @@ func configFromEnv() config {
 		maxProcessorConns: envInt("MAX_PROCESSOR_CONNS", 64),
 		workerCount:       envInt("WORKERS", 20),
 		queueWait:         envDurationMS("QUEUE_WAIT_MS", 700*time.Millisecond),
-		queuePoll:         envDurationMS("QUEUE_POLL_MS", 20*time.Millisecond),
 		retryDelay:        envDurationMS("RETRY_DELAY_MS", 80*time.Millisecond),
 		maxQueueDepth:     int64(envInt("MAX_QUEUE_DEPTH", 20000)),
 		fallbackQueueSize: int64(envIntAllowZero("FALLBACK_QUEUE_SIZE", 200)),

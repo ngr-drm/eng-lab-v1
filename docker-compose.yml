@@ -22,19 +22,21 @@ services:
     build: .
     environment:
       LISTEN_ADDR: ":8080"
-      REDIS_ADDR: "valkey:6379"
+      REDIS_NETWORK: "unix"
+      REDIS_ADDR: "/var/run/valkey/valkey.sock"
       GOMAXPROCS: "1"
       WORKERS: "64"
       MAX_PROCESSOR_CONNS: "100"
       PROCESSOR_TIMEOUT_MS: "10000"
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
-      QUEUE_POLL_MS: "50"
       FALLBACK_QUEUE_SIZE: "200"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
       - valkey
+    volumes:
+      - valkey-socket:/var/run/valkey
     networks:
       - backend
       - payment-processor
@@ -49,19 +51,21 @@ services:
     build: .
     environment:
       LISTEN_ADDR: ":8080"
-      REDIS_ADDR: "valkey:6379"
+      REDIS_NETWORK: "unix"
+      REDIS_ADDR: "/var/run/valkey/valkey.sock"
       GOMAXPROCS: "1"
       WORKERS: "64"
       MAX_PROCESSOR_CONNS: "100"
       PROCESSOR_TIMEOUT_MS: "10000"
       PROCESSING_LEASE_MS: "25000"
       PROCESSOR_HEALTH_GRACE_MS: "1200"
-      QUEUE_POLL_MS: "50"
       FALLBACK_QUEUE_SIZE: "200"
       PROCESSOR_DEFAULT_URL: "http://payment-processor-default:8080"
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
       - valkey
+    volumes:
+      - valkey-socket:/var/run/valkey
     networks:
       - backend
       - payment-processor
@@ -74,7 +78,9 @@ services:
   valkey:
     container_name: valkey
     image: valkey/valkey:8.1-alpine
-    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    command: ["sh", "-c", "exec valkey-server --save '' --appendonly no --maxmemory 128mb --maxmemory-policy noeviction --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0"]
+    volumes:
+      - valkey-socket:/var/run/valkey
     networks:
       - backend
     deploy:
@@ -88,3 +94,6 @@ networks:
     driver: bridge
   payment-processor:
     external: true
+
+volumes:
+  valkey-socket:

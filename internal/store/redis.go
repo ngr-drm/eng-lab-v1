@@ -13,39 +13,42 @@ import (
 )
 
 type RedisConfig struct {
-	Addr              string
-	ProcessingLease   time.Duration
-	QueuePollInterval time.Duration
+	Network         string
+	Addr            string
+	ProcessingLease time.Duration
 }
 
 type Redis struct {
-	client            *redis.Client
-	processingLease   time.Duration
-	queuePollInterval time.Duration
+	client          *redis.Client
+	processingLease time.Duration
 }
 
 func NewRedis(cfg RedisConfig) *Redis {
+	network := cfg.Network
+	if network == "" {
+		network = "tcp"
+	}
 	addr := cfg.Addr
 	if addr == "" {
-		addr = "valkey:6379"
+		if network == "unix" {
+			addr = "/var/run/valkey/valkey.sock"
+		} else {
+			addr = "valkey:6379"
+		}
 	}
 	processingLease := cfg.ProcessingLease
 	if processingLease <= 0 {
 		processingLease = 15 * time.Second
 	}
-	queuePollInterval := cfg.QueuePollInterval
-	if queuePollInterval <= 0 {
-		queuePollInterval = 20 * time.Millisecond
-	}
 	return &Redis{
 		client: redis.NewClient(&redis.Options{
+			Network:      network,
 			Addr:         addr,
 			PoolSize:     64,
 			MinIdleConns: 8,
 			MaxRetries:   1,
 		}),
-		processingLease:   processingLease,
-		queuePollInterval: queuePollInterval,
+		processingLease: processingLease,
 	}
 }
 
@@ -79,13 +82,6 @@ func (r *Redis) EnqueuePayment(ctx context.Context, payment payments.Payment, ma
 
 func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredProcessor payments.ProcessorName) (payments.Payment, bool, error) {
 	deadline := time.Now().Add(wait)
-	var pollTimer *time.Timer
-	defer func() {
-		if pollTimer != nil {
-			pollTimer.Stop()
-		}
-	}()
-
 	for {
 		now := time.Now()
 		result, err := popPendingScript.Run(ctx, r.client, nil,
@@ -100,21 +96,16 @@ func (r *Redis) PopPending(ctx context.Context, wait time.Duration, preferredPro
 		if err != nil || ok {
 			return payment, ok, err
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if !deadline.After(time.Now()) {
 			return payments.Payment{}, false, nil
 		}
 
-		pollDelay := min(r.queuePollInterval, remaining)
-		if pollTimer == nil {
-			pollTimer = time.NewTimer(pollDelay)
-		} else {
-			pollTimer.Reset(pollDelay)
-		}
+		timer := time.NewTimer(20 * time.Millisecond)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return payments.Payment{}, false, ctx.Err()
-		case <-pollTimer.C:
+		case <-timer.C:
 		}
 	}
 }
