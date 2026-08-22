@@ -36,6 +36,7 @@ type ServiceConfig struct {
 	RetryDelay        time.Duration
 	MaxQueueDepth     int64
 	FallbackQueueSize int64
+	ObserveEnqueue    func(time.Duration)
 }
 
 type Service struct {
@@ -48,6 +49,7 @@ type Service struct {
 	retryDelay        time.Duration
 	maxQueueDepth     int64
 	fallbackQueueSize int64
+	observeEnqueue    func(time.Duration)
 	metrics           serviceMetrics
 	startOnce         sync.Once
 }
@@ -71,6 +73,7 @@ func NewService(cfg ServiceConfig) *Service {
 		retryDelay:        cfg.RetryDelay,
 		maxQueueDepth:     cfg.MaxQueueDepth,
 		fallbackQueueSize: cfg.FallbackQueueSize,
+		observeEnqueue:    cfg.ObserveEnqueue,
 	}
 }
 
@@ -85,7 +88,11 @@ func (s *Service) Accept(ctx context.Context, payment Payment) (bool, error) {
 		payment.RequestedAt = time.Now().UTC()
 	}
 
+	startedAt := time.Now()
 	enqueued, err := s.store.EnqueuePayment(ctx, payment, s.maxQueueDepth)
+	if s.observeEnqueue != nil {
+		s.observeEnqueue(time.Since(startedAt))
+	}
 	if err != nil {
 		return false, err
 	}

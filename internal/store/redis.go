@@ -13,7 +13,6 @@ import (
 )
 
 type RedisConfig struct {
-	Network         string
 	Addr            string
 	ProcessingLease time.Duration
 }
@@ -24,17 +23,9 @@ type Redis struct {
 }
 
 func NewRedis(cfg RedisConfig) *Redis {
-	network := cfg.Network
-	if network == "" {
-		network = "tcp"
-	}
 	addr := cfg.Addr
 	if addr == "" {
-		if network == "unix" {
-			addr = "/var/run/valkey/valkey.sock"
-		} else {
-			addr = "valkey:6379"
-		}
+		addr = "valkey:6379"
 	}
 	processingLease := cfg.ProcessingLease
 	if processingLease <= 0 {
@@ -42,7 +33,6 @@ func NewRedis(cfg RedisConfig) *Redis {
 	}
 	return &Redis{
 		client: redis.NewClient(&redis.Options{
-			Network:      network,
 			Addr:         addr,
 			PoolSize:     64,
 			MinIdleConns: 8,

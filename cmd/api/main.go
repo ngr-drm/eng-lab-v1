@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"eng-lab-v1/internal/diagnostics"
 	apphttp "eng-lab-v1/internal/http"
 	"eng-lab-v1/internal/payments"
 	"eng-lab-v1/internal/processor"
@@ -24,8 +25,10 @@ func main() {
 	defer stop()
 
 	cfg := configFromEnv()
+	diagnosticCollector := diagnostics.New(logger, 30*time.Second)
+	diagnosticCollector.Start(ctx)
+
 	st := store.NewRedis(store.RedisConfig{
-		Network:         cfg.redisNetwork,
 		Addr:            cfg.redisAddr,
 		ProcessingLease: cfg.processingLease,
 	})
@@ -62,12 +65,13 @@ func main() {
 		RetryDelay:        cfg.retryDelay,
 		MaxQueueDepth:     cfg.maxQueueDepth,
 		FallbackQueueSize: cfg.fallbackQueueSize,
+		ObserveEnqueue:    diagnosticCollector.ObserveEnqueue,
 	})
 
 	service.Start(ctx)
 
 	mux := http.NewServeMux()
-	apphttp.Register(mux, service, logger)
+	apphttp.Register(mux, service, logger, diagnosticCollector.ObservePost)
 
 	server := &http.Server{
 		Addr:              cfg.listenAddr,
@@ -105,7 +109,6 @@ func main() {
 
 type config struct {
 	listenAddr        string
-	redisNetwork      string
 	redisAddr         string
 	defaultURL        string
 	fallbackURL       string
@@ -123,7 +126,6 @@ type config struct {
 func configFromEnv() config {
 	return config{
 		listenAddr:        envString("LISTEN_ADDR", ":8080"),
-		redisNetwork:      envString("REDIS_NETWORK", "tcp"),
 		redisAddr:         envString("REDIS_ADDR", "valkey:6379"),
 		defaultURL:        envString("PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
 		fallbackURL:       envString("PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),

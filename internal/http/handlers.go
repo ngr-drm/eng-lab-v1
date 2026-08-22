@@ -18,18 +18,20 @@ type Service interface {
 }
 
 type Handler struct {
-	service Service
-	logger  *slog.Logger
+	service     Service
+	logger      *slog.Logger
+	observePost func(time.Duration)
 }
 
-func Register(mux *http.ServeMux, service Service, logger *slog.Logger) {
-	handler := Handler{service: service, logger: logger}
+func Register(mux *http.ServeMux, service Service, logger *slog.Logger, observePost func(time.Duration)) {
+	handler := Handler{service: service, logger: logger, observePost: observePost}
 	mux.HandleFunc("POST /payments", handler.payments)
 	mux.HandleFunc("GET /payments-summary", handler.summary)
 	mux.HandleFunc("GET /health", handler.health)
 }
 
 func (h Handler) payments(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	defer r.Body.Close()
 
 	var input paymentInput
@@ -69,6 +71,9 @@ func (h Handler) payments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+	if h.observePost != nil {
+		h.observePost(time.Since(startedAt))
+	}
 }
 
 func (h Handler) summary(w http.ResponseWriter, r *http.Request) {

@@ -22,8 +22,7 @@ services:
     build: .
     environment:
       LISTEN_ADDR: ":8080"
-      REDIS_NETWORK: "unix"
-      REDIS_ADDR: "/var/run/valkey/valkey.sock"
+      REDIS_ADDR: "valkey:6379"
       GOMAXPROCS: "1"
       WORKERS: "64"
       MAX_PROCESSOR_CONNS: "100"
@@ -35,8 +34,6 @@ services:
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
       - valkey
-    volumes:
-      - valkey-socket:/var/run/valkey
     networks:
       - backend
       - payment-processor
@@ -51,8 +48,7 @@ services:
     build: .
     environment:
       LISTEN_ADDR: ":8080"
-      REDIS_NETWORK: "unix"
-      REDIS_ADDR: "/var/run/valkey/valkey.sock"
+      REDIS_ADDR: "valkey:6379"
       GOMAXPROCS: "1"
       WORKERS: "64"
       MAX_PROCESSOR_CONNS: "100"
@@ -64,8 +60,6 @@ services:
       PROCESSOR_FALLBACK_URL: "http://payment-processor-fallback:8080"
     depends_on:
       - valkey
-    volumes:
-      - valkey-socket:/var/run/valkey
     networks:
       - backend
       - payment-processor
@@ -78,9 +72,7 @@ services:
   valkey:
     container_name: valkey
     image: valkey/valkey:8.1-alpine
-    command: ["sh", "-c", "exec valkey-server --save '' --appendonly no --maxmemory 128mb --maxmemory-policy noeviction --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0"]
-    volumes:
-      - valkey-socket:/var/run/valkey
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
     networks:
       - backend
     deploy:
@@ -94,6 +86,3 @@ networks:
     driver: bridge
   payment-processor:
     external: true
-
-volumes:
-  valkey-socket:
